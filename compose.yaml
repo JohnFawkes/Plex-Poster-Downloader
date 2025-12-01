@@ -1,6 +1,6 @@
 services:
   plex-poster-downloader:
-    build: .
+    image: ghcr.io/johnfawkes/plex-poster-downloader:latest
     container_name: plex-poster-manager
     restart: unless-stopped
     ports:
