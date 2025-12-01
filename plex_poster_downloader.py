@@ -91,17 +91,22 @@ def inject_global_vars():
 # ==========================================
 @app.before_request
 def require_auth():
-    if request.endpoint in ['static', 'login', 'setup', 'logout']:
+    # Allow static resources, login, and settings (for setup)
+    if request.endpoint in ['static', 'login', 'settings', 'logout']:
         return
 
     cfg = get_config()
     
+    # 0. Check if Auth is explicitly disabled
     if cfg.get('AUTH_DISABLED', False):
         return
     
+    # 1. Check if Setup is needed (No Admin User)
+    # Redirect to settings so user can set up account or disable auth
     if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']:
-        return redirect(url_for('setup'))
+        return redirect(url_for('settings'))
     
+    # 2. Check if Logged In
     if 'user' not in session:
         return redirect(url_for('login'))
     
@@ -236,7 +241,6 @@ def check_file_exists(item, lib_title=None):
 def get_item_status(item, lib_title):
     """
     Returns item status: 'complete', 'missing', or 'partial'.
-    Using accurate but slower check that loops through season objects.
     """
     if is_overridden(item.ratingKey):
         return 'complete'
@@ -515,7 +519,7 @@ HTML_TOP = """
             </div>
             <a href="/settings" class="settings-link" title="Settings">⚙️</a>
             {% if auth_disabled %}
-                <a href="/setup" class="settings-link" title="Login / Enable Auth" style="font-size:0.9em; margin-left: 20px;">Login</a>
+                <a href="/settings" class="settings-link" title="Login / Enable Auth" style="font-size:0.9em; margin-left: 20px;">Login</a>
             {% else %}
                 <a href="/logout" class="settings-link" title="Logout" style="font-size:0.9em; margin-left: 20px;">Logout</a>
             {% endif %}
@@ -647,35 +651,6 @@ def api_search():
         print(f"Search Error: {e}")
         return jsonify([])
 
-@app.route('/setup', methods=['GET', 'POST'])
-def setup():
-    cfg = get_config()
-    if 'AUTH_USER' in cfg and cfg['AUTH_USER']:
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        confirm = request.form['confirm_password']
-        
-        if password != confirm:
-            flash("Passwords do not match.")
-        elif len(password) < 4:
-            flash("Password must be at least 4 characters.")
-        else:
-            cfg['AUTH_USER'] = username
-            cfg['AUTH_HASH'] = generate_password_hash(password)
-            cfg['AUTH_DISABLED'] = False
-            save_config(cfg)
-            flash("Account created! Please login.")
-            return redirect(url_for('login'))
-
-    return render_template_string(HTML_LOGIN_SETUP, 
-                                  title="Setup Admin", 
-                                  subtitle="Create your admin account to secure access.",
-                                  btn_text="Create Account",
-                                  is_setup=True)
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     cfg = get_config()
@@ -713,6 +688,10 @@ def logout():
 @app.route('/settings', methods=['GET', 'POST'])
 def settings():
     cfg = get_config()
+    
+    # Check if this is "first run" / unconfigured
+    is_unconfigured = 'AUTH_USER' not in cfg or not cfg['AUTH_USER']
+    auth_disabled = cfg.get('AUTH_DISABLED', False)
     
     # Fetch all libraries for the checkbox list
     all_libs = []
@@ -762,21 +741,49 @@ def settings():
                 cfg['AUTH_HASH'] = generate_password_hash(new_pw)
                 save_config(cfg)
                 flash("Password updated successfully.")
+        
+        elif action == 'create_account':
+            username = request.form.get('new_username')
+            new_pw = request.form.get('new_password')
+            confirm_pw = request.form.get('confirm_password')
+            
+            if new_pw != confirm_pw:
+                flash("Passwords do not match.")
+            elif len(new_pw) < 4:
+                flash("Password must be at least 4 characters.")
+            else:
+                cfg['AUTH_USER'] = username
+                cfg['AUTH_HASH'] = generate_password_hash(new_pw)
+                cfg['AUTH_DISABLED'] = False
+                save_config(cfg)
+                
+                # Auto login after creation
+                session.permanent = True
+                session['user'] = username
+                flash("Account created successfully!")
+                return redirect(url_for('home'))
                 
         elif action == 'disable_auth':
-            current_pw = request.form.get('current_password_disable')
-            stored_hash = cfg.get('AUTH_HASH')
-            
-            if not stored_hash or not check_password_hash(stored_hash, current_pw):
-                flash("Incorrect password. Cannot disable authentication.")
-            else:
+            # If unconfigured, no password needed to disable
+            if is_unconfigured:
                 cfg['AUTH_DISABLED'] = True
-                cfg.pop('AUTH_USER', None)
-                cfg.pop('AUTH_HASH', None)
                 save_config(cfg)
-                session.clear()
-                flash("Authentication completely disabled.")
+                flash("Authentication disabled.")
                 return redirect(url_for('home'))
+            else:
+                # If configured, require password
+                current_pw = request.form.get('current_password_disable')
+                stored_hash = cfg.get('AUTH_HASH')
+                if not stored_hash or not check_password_hash(stored_hash, current_pw):
+                    flash("Incorrect password. Cannot disable authentication.")
+                else:
+                    cfg['AUTH_DISABLED'] = True
+                    cfg.pop('AUTH_USER', None)
+                    cfg.pop('AUTH_HASH', None)
+                    save_config(cfg)
+                    session.clear()
+                    flash("Authentication completely disabled.")
+                    return redirect(url_for('home'))
             
         return redirect(url_for('settings'))
 
@@ -834,14 +841,46 @@ def settings():
         <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none;">
             <h2 style="margin-top:0; color: #fff;">Account Security</h2>
             
-            {% if cfg.get('AUTH_DISABLED') %}
-                <div style="background: rgba(229, 160, 13, 0.1); padding: 15px; border-radius: 8px; border: 1px solid var(--accent); margin-bottom: 20px;">
-                    <strong style="color: var(--accent);">Authentication is currently disabled.</strong>
-                    <p style="margin: 5px 0 0 0; font-size: 0.9em; color: var(--text-muted);">Anyone with access to this URL can download posters and change settings.</p>
-                </div>
-                <a href="/setup" class="btn">Enable Authentication</a>
-            {% else %}
+            {% if is_unconfigured or auth_disabled %}
+                <!-- UNCONFIGURED / DISABLED STATE -->
+                {% if auth_disabled %}
+                    <div style="background: rgba(229, 160, 13, 0.1); padding: 15px; border-radius: 8px; border: 1px solid var(--accent); margin-bottom: 20px;">
+                        <strong style="color: var(--accent);">Authentication is currently disabled.</strong>
+                        <p style="margin: 5px 0 0 0; font-size: 0.9em; color: var(--text-muted);">Use the form below to re-enable authentication by creating an account.</p>
+                    </div>
+                {% else %}
+                    <p style="color:var(--text-muted); margin-bottom:20px;">Authentication is not set up. Please create an admin account or disable authentication.</p>
+                {% endif %}
+
+                <form method="post" style="margin-bottom: 30px;">
+                    <input type="hidden" name="action" value="create_account">
+                    <h3 style="font-size: 1.1em; color: var(--text);">Setup Admin Account</h3>
+                    <div class="form-group">
+                        <label>Username</label>
+                        <input type="text" name="new_username" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" name="new_password" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Confirm Password</label>
+                        <input type="password" name="confirm_password" required>
+                    </div>
+                    <button type="submit" class="btn">Create Account & Enable Auth</button>
+                </form>
                 
+                {% if not auth_disabled %}
+                <div style="border-top: 1px solid #4b5563; padding-top: 20px;">
+                    <form method="post" onsubmit="return confirm('Are you sure? Anyone will be able to access this site.');">
+                        <input type="hidden" name="action" value="disable_auth">
+                        <button type="submit" class="btn btn-danger">Disable Authentication</button>
+                    </form>
+                </div>
+                {% endif %}
+                
+            {% else %}
+                <!-- CONFIGURED STATE -->
                 <div style="margin-bottom: 30px;">
                     <form method="post">
                         <input type="hidden" name="action" value="change_password">
@@ -882,7 +921,7 @@ def settings():
         
     </div>
     """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=cfg, all_libs=all_libs, breadcrumbs=[('Settings', '#')], toggle_override=False)
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=cfg, all_libs=all_libs, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
 
 @app.route('/')
 def home():
@@ -1250,3 +1289,6 @@ if __name__ == '__main__':
     print(f"Starting WebUI on http://0.0.0.0:5000")
     print(f"Go to Settings to configure Plex connection.")
     app.run(host='0.0.0.0', port=5000, debug=True)
+
+
+
