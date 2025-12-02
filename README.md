@@ -4,6 +4,10 @@ A self-hosted web application that allows you to easily browse your Plex librari
 
 This tool is perfect for users who want to switch to "Local Assets" agents, use tools like Kometa (formerly PMM), or simply want a backup of their curated artwork stored alongside their media files.
 
+## **AI WARNING**
+THIS SCRIPT WAS GENERATED USING GOOGLE GEMINI! I KNOW THIS CAN BE A TURN OFF FOR SOME BUT HAS BEEN TESTED AND WORKS GREAT! JUST GIVING THIS WARNING NOW AS I KNOW SOME DONT LIKE AI MADE SCRIPTS
+YOU HAVE BEEN WARNED.
+
 ## ✨ Features
 
 * **Plex-Themed Web UI:** A dark, responsive interface designed to feel like home for Plex users.
