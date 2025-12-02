@@ -102,7 +102,7 @@ def require_auth():
         return
     
     if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']:
-        return redirect(url_for('setup'))
+        return redirect(url_for('settings'))
     
     if 'user' not in session:
         return redirect(url_for('login'))
@@ -345,30 +345,20 @@ def perform_migration(target_style):
             files = [f for f in lib_contents if os.path.isfile(os.path.join(lib_path, f)) and f.lower().endswith('.jpg')]
             dirs = [d for d in lib_contents if os.path.isdir(os.path.join(lib_path, d))]
             
-            # ---------------------------
             # 1. PROCESS EXISTING FLAT FILES
-            # ---------------------------
             for f in files:
                 src = os.path.join(lib_path, f)
                 filename_no_ext = os.path.splitext(f)[0]
                 
                 if target_style == 'ASSET_FOLDERS':
-                    # GOAL: Convert "Show_Season01.jpg" -> "Show/Season01.jpg"
-                    #       Convert "Movie.jpg" -> "Movie/poster.jpg"
-                    
-                    # Regex to detect Season Flat File: "ShowName_Season01"
-                    # Matches end of string like _Season01 or _Specials
                     match = re.match(r"(.*)_(Season\d+|Specials)$", filename_no_ext, re.IGNORECASE)
                     
                     if match:
-                        # It's a Season File
                         show_name = match.group(1)
-                        season_part = match.group(2) # Season01 or Specials
-                        
+                        season_part = match.group(2) 
                         dest_dir = os.path.join(lib_path, show_name)
                         dest = os.path.join(dest_dir, f"{season_part}.jpg")
                     else:
-                        # It's a Movie/Show Poster
                         dest_dir = os.path.join(lib_path, filename_no_ext)
                         dest = os.path.join(dest_dir, "poster.jpg")
                     
@@ -377,33 +367,24 @@ def perform_migration(target_style):
                         if not os.path.exists(dest):
                             shutil.move(src, dest)
                             moved_count += 1
-                        elif src != dest:
-                            # Cleanup duplicate if stuck
-                            pass
                     except Exception as e:
                         errors.append(f"Error moving flat file {f}: {e}")
 
-            # ---------------------------
             # 2. PROCESS EXISTING DIRECTORIES
-            # ---------------------------
             for d in dirs:
                 item_dir = os.path.join(lib_path, d)
                 item_contents = os.listdir(item_dir)
                 
-                # Check for Asset Style files inside this folder
-                # (e.g. poster.jpg, Season01.jpg)
                 for item_file in item_contents:
                     src = os.path.join(item_dir, item_file)
                     
                     if os.path.isdir(src):
-                        continue # Skip subfolders here (handled in Legacy section)
+                        continue
                     if not item_file.lower().endswith('.jpg'):
                         continue
 
-                    # If we are converting TO Flat structure
                     if target_style == 'NO_ASSET_FOLDERS':
                         if item_file.lower() == 'poster.jpg':
-                            # "Item/poster.jpg" -> "Item.jpg"
                             dest = os.path.join(lib_path, f"{d}.jpg")
                             try:
                                 if not os.path.exists(dest):
@@ -413,7 +394,6 @@ def perform_migration(target_style):
                                 errors.append(f"Error flattening poster {d}: {e}")
                                 
                         elif re.match(r"(Season\d+|Specials)\.jpg", item_file, re.IGNORECASE):
-                            # "Item/Season01.jpg" -> "Item_Season01.jpg"
                             fname_no_ext = os.path.splitext(item_file)[0]
                             dest = os.path.join(lib_path, f"{d}_{fname_no_ext}.jpg")
                             try:
@@ -423,11 +403,9 @@ def perform_migration(target_style):
                             except Exception as e:
                                 errors.append(f"Error flattening season {d}: {e}")
 
-                # Check for Legacy Subfolders (e.g. "Season 01")
-                # These need to be normalized regardless of target style
+                # Check for Legacy Subfolders
                 subdirs = [sd for sd in item_contents if os.path.isdir(os.path.join(item_dir, sd))]
                 for sd in subdirs:
-                    # Detect season number
                     season_str = None
                     if sd.lower() == 'specials':
                         season_str = 'Season00'
@@ -438,34 +416,25 @@ def perform_migration(target_style):
                             season_str = f"Season{num:02d}"
                     
                     if season_str:
-                        # Look for poster.jpg inside legacy folder
                         legacy_poster = os.path.join(item_dir, sd, "poster.jpg")
                         if os.path.exists(legacy_poster):
-                            
                             if target_style == 'ASSET_FOLDERS':
-                                # "Item/Season 01/poster.jpg" -> "Item/Season01.jpg"
                                 dest = os.path.join(item_dir, f"{season_str}.jpg")
                             else:
-                                # "Item/Season 01/poster.jpg" -> "Item_Season01.jpg"
                                 dest = os.path.join(lib_path, f"{d}_{season_str}.jpg")
                             
                             try:
                                 if not os.path.exists(dest):
                                     shutil.move(legacy_poster, dest)
                                     moved_count += 1
-                                # Try to delete the legacy folder if empty
                                 try: os.rmdir(os.path.join(item_dir, sd))
                                 except: pass
                             except Exception as e:
                                 errors.append(f"Error migrating legacy folder {d}/{sd}: {e}")
 
-                # Cleanup: If converting to Flat, attempt to remove the Item directory if it's now empty
                 if target_style == 'NO_ASSET_FOLDERS':
-                    try:
-                        # os.rmdir only removes empty dirs
-                        os.rmdir(item_dir) 
-                    except:
-                        pass
+                    try: os.rmdir(item_dir) 
+                    except: pass
 
     except Exception as e:
         return 0, str(e)
@@ -712,7 +681,7 @@ HTML_TOP = """
             </div>
             <a href="/settings" class="settings-link" title="Settings">⚙️</a>
             {% if auth_disabled %}
-                <a href="/setup" class="settings-link" title="Login / Enable Auth" style="font-size:0.9em; margin-left: 20px;">Login</a>
+                <a href="/settings" class="settings-link" title="Login / Enable Auth" style="font-size:0.9em; margin-left: 20px;">Login</a>
             {% else %}
                 <a href="/logout" class="settings-link" title="Logout" style="font-size:0.9em; margin-left: 20px;">Logout</a>
             {% endif %}
@@ -1214,7 +1183,7 @@ def home():
         {% for lib in visible_libs %}
             {% set icon = '🎬' if lib.type == 'movie' else '📺' if lib.type == 'show' else '📁' %}
             <a href="/library/{{ lib.key }}" class="card home-card" style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; min-height: 200px; text-decoration: none;">
-                <div style="font-size: 4em; margin-bottom: 15px; text-shadow: 0 4px 8px rgba(0,0,0,0.3);">{{ icon }}</div>
+                <div style="font-size: 4em; margin-bottom: 15px; text-shadow: 0 0 10px var(--accent);">{{ icon }}</div>
                 <div class="title" style="font-size: 1.4em; font-weight: 700; text-align: center; color: var(--text); margin-bottom: 5px;">{{ lib.title }}</div>
                 <div style="font-size: 0.85em; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1.5px; font-weight: 500;">{{ lib.type.title() }}</div>
             </a>
@@ -1259,22 +1228,49 @@ def view_library(lib_id):
 
     done_ids_map = {item.ratingKey: item for item in done_objects_from_history}
 
+    # SELF-HEALING: Check if manual deletes happened for historical items
+    keys_to_remove = []
+    for key, item in list(done_ids_map.items()):
+        status = get_item_status(item, lib.title)
+        if status != 'complete':
+            keys_to_remove.append(key)
+    
+    # Remove from local map and JSON
+    if keys_to_remove:
+        for k in keys_to_remove:
+            del done_ids_map[k]
+            k_str = str(k)
+            if k_str in history['downloads']: del history['downloads'][k_str]
+            if k_str in history['overrides']: history['overrides'].remove(k_str)
+        save_history_data(history)
+
     todo_items = []
     partial_items = []
     
     # 3. Process the CURRENT PAGE items
+    new_found_items = []
+    
     for i in items:
         status = get_item_status(i, lib.title)
         
         if status == 'complete':
             if i.ratingKey not in done_ids_map:
                 done_ids_map[i.ratingKey] = i
+                # SELF-HEALING: Add to history if found on disk but missing in JSON
+                new_found_items.append(i.ratingKey)
         elif status == 'partial':
             thumb = i.thumbUrl if i.thumb else ''
             partial_items.append({'title': i.title, 'ratingKey': i.ratingKey, 'thumbUrl': thumb})
         else:
             thumb = i.thumbUrl if i.thumb else ''
             todo_items.append({'title': i.title, 'ratingKey': i.ratingKey, 'thumbUrl': thumb})
+
+    # Save new found items to history
+    if new_found_items:
+        for k in new_found_items:
+            # We don't have the URL, but we mark it as downloaded to persist state
+            history['downloads'][str(k)] = "restored_from_disk"
+        save_history_data(history)
 
     # 4. Construct the Final "Already Downloaded" list
     done_items_list = []
@@ -1383,6 +1379,13 @@ def view_item(rating_key):
     lib = item.section()
     
     selected_url = get_history_url(rating_key)
+    
+    # Validation: Only allow highlighting if the file actually exists
+    if selected_url:
+        file_path = get_target_file_path(item, lib.title)
+        if not file_path or not os.path.exists(file_path):
+            selected_url = None # Clear highlight if missing
+            
     override_status = is_overridden(rating_key) if is_show else False
     
     seasons = []
@@ -1453,6 +1456,12 @@ def view_season(rating_key):
     lib = show.section()
     
     selected_url = get_history_url(rating_key)
+    
+    # Validation
+    if selected_url:
+        file_path = get_target_file_path(season, lib.title)
+        if not file_path or not os.path.exists(file_path):
+            selected_url = None
 
     target_path = get_target_file_path(season, lib.title)
     

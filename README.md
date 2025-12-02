@@ -8,7 +8,7 @@ This tool is perfect for users who want to switch to "Local Assets" agents, use 
 
 * **Plex-Themed Web UI:** A dark, responsive interface designed to feel like home for Plex users.
 
-* **Flexible Asset Structures:** Support for both Asset Folders (Kometa style) and Flat naming conventions.
+* **Flexible Asset Structures:** Support for both Asset Folders and Flat naming conventions.
 
 * **Migration Tool:** Built-in utility to scan and convert your existing downloaded posters between folder structures.
 
@@ -179,3 +179,10 @@ This tool supports two different naming conventions for saving posters. You can 
 
 **Login loop or Session errors:**
 The app generates a new secret key on every restart for security. If you restart the container, you will need to log in again.
+
+## **Future Plans**
+
+* Add support for titlecards
+* Add support for logos
+* Add support for backgrounds
+* Maybe add manual upploading of assets to the webui for ease of use when you may not have access to the internal filesystem to place them manully
