@@ -269,7 +269,6 @@ def check_file_exists(item, lib_title=None):
 def get_item_status(item, lib_title):
     """
     Returns item status: 'complete', 'missing', or 'partial'.
-    Using accurate but slower check that loops through season objects.
     """
     if is_overridden(item.ratingKey):
         return 'complete'
@@ -307,6 +306,80 @@ def get_poster_url(poster):
     if not key: return ""
     if key.startswith('http') or key.startswith('https'): return key
     return plex.url(key)
+
+# ==========================================
+# STATS & UTILS
+# ==========================================
+def format_size(size_bytes):
+    if size_bytes == 0: return "0 B"
+    size_name = ("B", "KB", "MB", "GB", "TB")
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return "%s %s" % (s, size_name[i])
+
+def get_library_stats(lib):
+    """
+    Calculates stats for a single library:
+    - Movies/Shows count (Plex)
+    - Episodes count (Plex - via raw query for speed)
+    - Downloaded Posters count (Local)
+    - Disk Usage (Local)
+    """
+    stats = {
+        'type': lib.type,
+        'content_str': "0 Items",
+        'downloaded_count': 0,
+        'disk_size': 0,
+        'size_str': "0 B"
+    }
+    
+    # 1. Plex Counts (Fast Raw Queries)
+    try:
+        if lib.type == 'movie':
+            count = lib.totalSize
+            stats['content_str'] = f"{count} Movies"
+        elif lib.type == 'show':
+            show_count = lib.totalSize
+            ep_count = 0
+            try:
+                # type=4 is episode. X-Plex-Container-Size=0 requests just the count header.
+                key = f'/library/sections/{lib.key}/all?type=4&X-Plex-Container-Start=0&X-Plex-Container-Size=0'
+                container = plex.query(key)
+                ep_count = int(container.attrib.get('totalSize', 0))
+            except Exception as e:
+                print(f"Error fetching episode count: {e}")
+                pass
+            stats['content_str'] = f"{show_count} Shows, {ep_count} Episodes"
+    except:
+        pass
+        
+    # 2. Local File Stats
+    cfg = get_config()
+    base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
+    # Handle Docker relative path
+    if not os.path.isabs(base_dir) and DATA_DIR != '.':
+        base_dir = os.path.join(DATA_DIR, base_dir)
+        
+    clean_lib = sanitize_filename(lib.title)
+    lib_dir = os.path.join(base_dir, clean_lib)
+    
+    file_count = 0
+    total_size = 0
+    
+    if os.path.exists(lib_dir):
+        for root, dirs, files in os.walk(lib_dir):
+            for f in files:
+                if f.lower().endswith('.jpg') or f.lower().endswith('.png'):
+                    fp = os.path.join(root, f)
+                    file_count += 1
+                    total_size += os.path.getsize(fp)
+    
+    stats['downloaded_count'] = file_count
+    stats['disk_size'] = total_size
+    stats['size_str'] = format_size(total_size)
+    
+    return stats
 
 # ==========================================
 # MIGRATION UTILS
@@ -515,6 +588,14 @@ CSS_COMMON = """
     
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 25px; }
     
+    /* Separate Grid for Home Page to allow growth */
+    .home-grid { 
+        display: flex; 
+        flex-wrap: wrap; 
+        justify-content: center; 
+        gap: 25px; 
+    }
+    
     .card { 
         background: var(--card); border-radius: 12px; overflow: hidden; 
         transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s; position: relative; 
@@ -532,6 +613,11 @@ CSS_COMMON = """
     .card:hover .title { color: var(--accent); }
     
     /* Homepage Card Special Styling */
+    .home-card {
+        flex: 1 1 300px;
+        min-width: 250px;
+        /* No max-width allows it to grow infinitely */
+    }
     .home-card:hover { border: 2px solid var(--accent); }
     .home-card:hover .title { color: var(--accent) !important; }
     
@@ -585,6 +671,15 @@ CSS_COMMON = """
     .section-header { margin-top: 50px; border-bottom: 2px solid var(--nav); padding-bottom: 10px; margin-bottom: 25px; display: flex; align-items: center; justify-content: space-between; }
     .section-header h2 { margin: 0; font-size: 1.4em; }
     .section-header span { font-size: 0.9em; color: var(--text-muted); background: var(--nav); padding: 4px 10px; border-radius: 20px; }
+    
+    /* Stats Table */
+    .stats-container { margin-top: 60px; border-top: 1px solid var(--border-color); padding-top: 30px; }
+    .stats-table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.2); }
+    .stats-table th, .stats-table td { padding: 15px; text-align: left; border-bottom: 1px solid var(--border-color); }
+    .stats-table th { background: rgba(255,255,255,0.05); font-weight: 600; color: var(--text-muted); text-transform: uppercase; font-size: 0.85em; letter-spacing: 1px; }
+    .stats-table tr:last-child td { border-bottom: none; }
+    .stats-table tr:hover { background: rgba(255,255,255,0.02); }
+    .stat-number { font-family: monospace; color: var(--accent); font-weight: bold; }
 """
 
 HTML_TOP = """
@@ -716,67 +811,7 @@ HTML_BOTTOM = """
 </html>
 """
 
-HTML_LOGIN_SETUP = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - Poster Manager</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>">
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet">
-    <style>
-        """ + CSS_COMMON + """
-        body { display: flex; align-items: center; justify-content: center; height: 100vh; padding: 0; }
-        .auth-container { width: 100%; max-width: 400px; }
-        .card { padding: 40px; transform: none !important; cursor: default !important; }
-        .card:hover { transform: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-    </style>
-</head>
-<body>
-    <div class="auth-container">
-        <div class="card">
-            <div style="text-align: center; margin-bottom: 30px;">
-                <div style="font-size: 3em;">🎬</div>
-                <h2>{{ title }}</h2>
-                <p style="color: var(--text-muted);">{{ subtitle }}</p>
-            </div>
-            
-            {% with messages = get_flashed_messages() %}
-                {% if messages %}
-                    {% for message in messages %}
-                        <div class="flash" style="text-align:center;">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-            
-            <form method="post">
-                <div class="form-group">
-                    <label>Username</label>
-                    <input type="text" name="username" required autofocus>
-                </div>
-                <div class="form-group">
-                    <label>Password</label>
-                    <input type="password" name="password" required>
-                </div>
-                {% if is_setup %}
-                <div class="form-group">
-                    <label>Confirm Password</label>
-                    <input type="password" name="confirm_password" required>
-                </div>
-                {% endif %}
-                <button type="submit" class="btn">{{ btn_text }}</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-# ==========================================
-# ROUTES
-# ==========================================
-
+# ... existing setup routes ...
 @app.route('/api/search')
 def api_search():
     if not plex: return jsonify([])
@@ -1177,9 +1212,20 @@ def home():
     
     # Filter ignored libs
     visible_libs = [lib for lib in libs if lib.title not in ignored]
+    
+    # Calculate stats for each visible library
+    lib_stats = []
+    for lib in visible_libs:
+        stats = get_library_stats(lib)
+        lib_stats.append({
+            'title': lib.title,
+            'content': stats['content_str'], # Unified content string
+            'downloaded': stats['downloaded_count'],
+            'size': stats['size_str']
+        })
 
     content = """
-    <div class="grid">
+    <div class="home-grid">
         {% for lib in visible_libs %}
             {% set icon = '🎬' if lib.type == 'movie' else '📺' if lib.type == 'show' else '📁' %}
             <a href="/library/{{ lib.key }}" class="card home-card" style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; min-height: 200px; text-decoration: none;">
@@ -1189,9 +1235,36 @@ def home():
             </a>
         {% endfor %}
     </div>
+    
+    <div class="stats-container">
+        <div class="section-header" style="margin-top:0;">
+            <h2>Library Statistics</h2>
+        </div>
+        <table class="stats-table">
+            <thead>
+                <tr>
+                    <th>Library</th>
+                    <th>Content</th>
+                    <th>Posters Downloaded</th>
+                    <th>Disk Usage</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for stat in lib_stats %}
+                <tr>
+                    <td style="font-weight:600; color:var(--text);">{{ stat.title }}</td>
+                    <td class="stat-number">{{ stat.content }}</td>
+                    <td class="stat-number" style="color:var(--accent);">{{ stat.downloaded }}</td>
+                    <td class="stat-number" style="color:var(--text-muted);">{{ stat.size }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
     """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, visible_libs=visible_libs, title="Select a Library", breadcrumbs=[], toggle_override=False)
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, visible_libs=visible_libs, lib_stats=lib_stats, title="Select a Library", breadcrumbs=[], toggle_override=False)
 
+# ... existing routes ...
 @app.route('/library/<lib_id>')
 def view_library(lib_id):
     if not plex: return redirect(url_for('settings'))
@@ -1376,6 +1449,7 @@ def view_item(rating_key):
 
     is_show = item.type == 'show'
     posters = item.posters()
+    folder_name = get_physical_folder_name(item)
     lib = item.section()
     
     selected_url = get_history_url(rating_key)
@@ -1552,6 +1626,7 @@ def toggle_complete():
     return redirect(request.referrer)
 
 if __name__ == '__main__':
+    # Initial setup if config doesn't exist
     if not os.path.exists(CONFIG_FILE):
         save_config(DEFAULT_CONFIG)
         
