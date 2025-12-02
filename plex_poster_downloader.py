@@ -269,6 +269,7 @@ def check_file_exists(item, lib_title=None):
 def get_item_status(item, lib_title):
     """
     Returns item status: 'complete', 'missing', or 'partial'.
+    Using accurate but slower check that loops through season objects.
     """
     if is_overridden(item.ratingKey):
         return 'complete'
@@ -601,6 +602,10 @@ CSS_COMMON = """
         transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s; position: relative; 
         box-shadow: 0 4px 6px rgba(0,0,0,0.2);
         border: 2px solid transparent;
+        /* Flex properties for Home Cards */
+        flex: 1 1 300px; /* Grow, Shrink, Basis */
+        max-width: 400px;
+        min-width: 250px;
     }
     .card:hover { 
         transform: translateY(-5px); 
@@ -811,7 +816,67 @@ HTML_BOTTOM = """
 </html>
 """
 
-# ... existing setup routes ...
+HTML_LOGIN_SETUP = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - Poster Manager</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        """ + CSS_COMMON + """
+        body { display: flex; align-items: center; justify-content: center; height: 100vh; padding: 0; }
+        .auth-container { width: 100%; max-width: 400px; }
+        .card { padding: 40px; transform: none !important; cursor: default !important; }
+        .card:hover { transform: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <div class="auth-container">
+        <div class="card">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <div style="font-size: 3em;">🎬</div>
+                <h2>{{ title }}</h2>
+                <p style="color: var(--text-muted);">{{ subtitle }}</p>
+            </div>
+            
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                    {% for message in messages %}
+                        <div class="flash" style="text-align:center;">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            
+            <form method="post">
+                <div class="form-group">
+                    <label>Username</label>
+                    <input type="text" name="username" required autofocus>
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" name="password" required>
+                </div>
+                {% if is_setup %}
+                <div class="form-group">
+                    <label>Confirm Password</label>
+                    <input type="password" name="confirm_password" required>
+                </div>
+                {% endif %}
+                <button type="submit" class="btn">{{ btn_text }}</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+# ==========================================
+# ROUTES
+# ==========================================
+
 @app.route('/api/search')
 def api_search():
     if not plex: return jsonify([])
