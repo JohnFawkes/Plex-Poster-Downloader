@@ -4,6 +4,7 @@ import re
 import json
 import requests
 import math
+import shutil
 from datetime import timedelta
 from flask import Flask, render_template_string, request, redirect, flash, url_for, session, jsonify
 from plexapi.server import PlexServer
@@ -23,7 +24,8 @@ DEFAULT_CONFIG = {
     'DOWNLOAD_BASE_DIR': os.path.join(DATA_DIR, 'downloaded_posters'),
     'HISTORY_FILE': os.path.join(DATA_DIR, 'download_history.json'),
     'AUTH_DISABLED': False,
-    'IGNORED_LIBRARIES': []
+    'IGNORED_LIBRARIES': [],
+    'ASSET_STYLE': 'ASSET_FOLDERS' # Options: 'ASSET_FOLDERS', 'NO_ASSET_FOLDERS'
 }
 
 def get_config():
@@ -91,22 +93,17 @@ def inject_global_vars():
 # ==========================================
 @app.before_request
 def require_auth():
-    # Allow static resources, login, and settings (for setup)
-    if request.endpoint in ['static', 'login', 'settings', 'logout']:
+    if request.endpoint in ['static', 'login', 'setup', 'logout']:
         return
 
     cfg = get_config()
     
-    # 0. Check if Auth is explicitly disabled
     if cfg.get('AUTH_DISABLED', False):
         return
     
-    # 1. Check if Setup is needed (No Admin User)
-    # Redirect to settings so user can set up account or disable auth
     if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']:
-        return redirect(url_for('settings'))
+        return redirect(url_for('setup'))
     
-    # 2. Check if Logged In
     if 'user' not in session:
         return redirect(url_for('login'))
     
@@ -199,14 +196,19 @@ def get_physical_folder_name(item):
         return "Unknown_Folder"
     return "Unknown_Type"
 
-def get_save_path_for_item(item, lib_title=None):
+def get_target_file_path(item, lib_title=None, style=None):
+    """
+    Returns the FULL target path (directory + filename) for a poster
+    based on the configured Asset Style.
+    """
     cfg = get_config()
     base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
+    current_style = style if style else cfg.get('ASSET_STYLE', 'ASSET_FOLDERS')
     
     # Handle relative paths for Docker
     if not os.path.isabs(base_dir) and DATA_DIR != '.':
         base_dir = os.path.join(DATA_DIR, base_dir)
-    
+        
     if not lib_title:
         if hasattr(item, 'section'):
              lib_title = item.section().title
@@ -217,30 +219,57 @@ def get_save_path_for_item(item, lib_title=None):
              lib_title = "Unknown_Library"
              
     clean_lib = sanitize_filename(lib_title)
-    folder_name = get_physical_folder_name(item)
     
-    path_parts = [base_dir, clean_lib]
-
-    if item.type == 'season':
-        show = item.show()
-        show_folder = get_physical_folder_name(show)
-        season_folder = folder_name
-        path_parts.append(show_folder)
-        path_parts.append(season_folder)
-    elif item.type == 'show':
-        path_parts.append(folder_name)
-    elif item.type == 'movie':
-        path_parts.append(folder_name)
+    # MOVIE
+    if item.type == 'movie':
+        folder_name = get_physical_folder_name(item) # e.g. "Avatar (2009)"
         
-    return os.path.join(*path_parts)
+        if current_style == 'NO_ASSET_FOLDERS':
+            # Flat: Library/Movie Name.jpg
+            return os.path.join(base_dir, clean_lib, f"{folder_name}.jpg")
+        else:
+            # Asset Folders: Library/Movie Name/poster.jpg
+            return os.path.join(base_dir, clean_lib, folder_name, "poster.jpg")
+
+    # SHOW
+    elif item.type == 'show':
+        folder_name = get_physical_folder_name(item) # e.g. "The Office"
+        
+        if current_style == 'NO_ASSET_FOLDERS':
+            # Flat: Library/Show Name.jpg
+            return os.path.join(base_dir, clean_lib, f"{folder_name}.jpg")
+        else:
+            # Asset Folders: Library/Show Name/poster.jpg
+            return os.path.join(base_dir, clean_lib, folder_name, "poster.jpg")
+
+    # SEASON
+    elif item.type == 'season':
+        show = item.show()
+        show_folder = get_physical_folder_name(show) # e.g. "The Office"
+        season_idx = item.index
+        # Format season number: Season01, Season00
+        season_str = f"Season{season_idx:02d}"
+        
+        if current_style == 'NO_ASSET_FOLDERS':
+            # Flat: Library/Show Name_SeasonXX.jpg
+            return os.path.join(base_dir, clean_lib, f"{show_folder}_{season_str}.jpg")
+        else:
+            # Asset Folders (Kometa style): Library/Show Name/SeasonXX.jpg
+            # Note: DOES NOT use a Season subfolder.
+            return os.path.join(base_dir, clean_lib, show_folder, f"{season_str}.jpg")
+            
+    return None
 
 def check_file_exists(item, lib_title=None):
-    save_path = get_save_path_for_item(item, lib_title)
-    return os.path.exists(os.path.join(save_path, "poster.jpg"))
+    target_path = get_target_file_path(item, lib_title)
+    if target_path:
+        return os.path.exists(target_path)
+    return False
 
 def get_item_status(item, lib_title):
     """
     Returns item status: 'complete', 'missing', or 'partial'.
+    Using accurate but slower check that loops through season objects.
     """
     if is_overridden(item.ratingKey):
         return 'complete'
@@ -278,6 +307,170 @@ def get_poster_url(poster):
     if not key: return ""
     if key.startswith('http') or key.startswith('https'): return key
     return plex.url(key)
+
+# ==========================================
+# MIGRATION UTILS
+# ==========================================
+def perform_migration(target_style):
+    """
+    Scans the local download directory ONLY and rearranges files based on the target style.
+    Does NOT query Plex.
+    """
+    cfg = get_config()
+    base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
+    # Handle Docker relative path
+    if not os.path.isabs(base_dir) and DATA_DIR != '.':
+        base_dir = os.path.join(DATA_DIR, base_dir)
+        
+    if not os.path.exists(base_dir):
+        return 0, "Download directory does not exist."
+
+    moved_count = 0
+    errors = []
+
+    try:
+        # Iterate over Libraries (e.g. "Movies", "TV Shows")
+        libraries = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+        
+        for lib_name in libraries:
+            lib_path = os.path.join(base_dir, lib_name)
+            
+            # --- STRATEGY ---
+            # 1. We iterate over all contents of the library folder.
+            # 2. We identify if items are FILES (Flat structure) or FOLDERS (Asset/Legacy structure).
+            # 3. We determine the identity (Show Name, Season Number) from the name/path.
+            # 4. We move it to the target path.
+            
+            lib_contents = os.listdir(lib_path)
+            files = [f for f in lib_contents if os.path.isfile(os.path.join(lib_path, f)) and f.lower().endswith('.jpg')]
+            dirs = [d for d in lib_contents if os.path.isdir(os.path.join(lib_path, d))]
+            
+            # ---------------------------
+            # 1. PROCESS EXISTING FLAT FILES
+            # ---------------------------
+            for f in files:
+                src = os.path.join(lib_path, f)
+                filename_no_ext = os.path.splitext(f)[0]
+                
+                if target_style == 'ASSET_FOLDERS':
+                    # GOAL: Convert "Show_Season01.jpg" -> "Show/Season01.jpg"
+                    #       Convert "Movie.jpg" -> "Movie/poster.jpg"
+                    
+                    # Regex to detect Season Flat File: "ShowName_Season01"
+                    # Matches end of string like _Season01 or _Specials
+                    match = re.match(r"(.*)_(Season\d+|Specials)$", filename_no_ext, re.IGNORECASE)
+                    
+                    if match:
+                        # It's a Season File
+                        show_name = match.group(1)
+                        season_part = match.group(2) # Season01 or Specials
+                        
+                        dest_dir = os.path.join(lib_path, show_name)
+                        dest = os.path.join(dest_dir, f"{season_part}.jpg")
+                    else:
+                        # It's a Movie/Show Poster
+                        dest_dir = os.path.join(lib_path, filename_no_ext)
+                        dest = os.path.join(dest_dir, "poster.jpg")
+                    
+                    try:
+                        os.makedirs(dest_dir, exist_ok=True)
+                        if not os.path.exists(dest):
+                            shutil.move(src, dest)
+                            moved_count += 1
+                        elif src != dest:
+                            # Cleanup duplicate if stuck
+                            pass
+                    except Exception as e:
+                        errors.append(f"Error moving flat file {f}: {e}")
+
+            # ---------------------------
+            # 2. PROCESS EXISTING DIRECTORIES
+            # ---------------------------
+            for d in dirs:
+                item_dir = os.path.join(lib_path, d)
+                item_contents = os.listdir(item_dir)
+                
+                # Check for Asset Style files inside this folder
+                # (e.g. poster.jpg, Season01.jpg)
+                for item_file in item_contents:
+                    src = os.path.join(item_dir, item_file)
+                    
+                    if os.path.isdir(src):
+                        continue # Skip subfolders here (handled in Legacy section)
+                    if not item_file.lower().endswith('.jpg'):
+                        continue
+
+                    # If we are converting TO Flat structure
+                    if target_style == 'NO_ASSET_FOLDERS':
+                        if item_file.lower() == 'poster.jpg':
+                            # "Item/poster.jpg" -> "Item.jpg"
+                            dest = os.path.join(lib_path, f"{d}.jpg")
+                            try:
+                                if not os.path.exists(dest):
+                                    shutil.move(src, dest)
+                                    moved_count += 1
+                            except Exception as e:
+                                errors.append(f"Error flattening poster {d}: {e}")
+                                
+                        elif re.match(r"(Season\d+|Specials)\.jpg", item_file, re.IGNORECASE):
+                            # "Item/Season01.jpg" -> "Item_Season01.jpg"
+                            fname_no_ext = os.path.splitext(item_file)[0]
+                            dest = os.path.join(lib_path, f"{d}_{fname_no_ext}.jpg")
+                            try:
+                                if not os.path.exists(dest):
+                                    shutil.move(src, dest)
+                                    moved_count += 1
+                            except Exception as e:
+                                errors.append(f"Error flattening season {d}: {e}")
+
+                # Check for Legacy Subfolders (e.g. "Season 01")
+                # These need to be normalized regardless of target style
+                subdirs = [sd for sd in item_contents if os.path.isdir(os.path.join(item_dir, sd))]
+                for sd in subdirs:
+                    # Detect season number
+                    season_str = None
+                    if sd.lower() == 'specials':
+                        season_str = 'Season00'
+                    else:
+                        match = re.match(r"Season\s*(\d+)", sd, re.IGNORECASE)
+                        if match:
+                            num = int(match.group(1))
+                            season_str = f"Season{num:02d}"
+                    
+                    if season_str:
+                        # Look for poster.jpg inside legacy folder
+                        legacy_poster = os.path.join(item_dir, sd, "poster.jpg")
+                        if os.path.exists(legacy_poster):
+                            
+                            if target_style == 'ASSET_FOLDERS':
+                                # "Item/Season 01/poster.jpg" -> "Item/Season01.jpg"
+                                dest = os.path.join(item_dir, f"{season_str}.jpg")
+                            else:
+                                # "Item/Season 01/poster.jpg" -> "Item_Season01.jpg"
+                                dest = os.path.join(lib_path, f"{d}_{season_str}.jpg")
+                            
+                            try:
+                                if not os.path.exists(dest):
+                                    shutil.move(legacy_poster, dest)
+                                    moved_count += 1
+                                # Try to delete the legacy folder if empty
+                                try: os.rmdir(os.path.join(item_dir, sd))
+                                except: pass
+                            except Exception as e:
+                                errors.append(f"Error migrating legacy folder {d}/{sd}: {e}")
+
+                # Cleanup: If converting to Flat, attempt to remove the Item directory if it's now empty
+                if target_style == 'NO_ASSET_FOLDERS':
+                    try:
+                        # os.rmdir only removes empty dirs
+                        os.rmdir(item_dir) 
+                    except:
+                        pass
+
+    except Exception as e:
+        return 0, str(e)
+
+    return moved_count, errors
 
 # ==========================================
 # HTML LAYOUT PARTS
@@ -411,11 +604,11 @@ CSS_COMMON = """
     
     .form-group { margin-bottom: 20px; }
     .form-group label { display: block; margin-bottom: 8px; font-weight: 600; color: var(--text-muted); }
-    .form-group input { 
+    .form-group input, .form-group select { 
         width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); 
         background: var(--input-bg); color: white; font-family: inherit; box-sizing: border-box;
     }
-    .form-group input:focus { outline: none; border-color: var(--primary); }
+    .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--primary); }
     .form-group input:disabled { background: #0a0a0a; color: #555; border-color: #222; cursor: not-allowed; }
     
     .flash { background: rgba(229, 160, 13, 0.2); color: var(--accent); padding: 15px; margin-bottom: 25px; border-radius: 8px; border: 1px solid var(--accent); }
@@ -519,7 +712,7 @@ HTML_TOP = """
             </div>
             <a href="/settings" class="settings-link" title="Settings">⚙️</a>
             {% if auth_disabled %}
-                <a href="/settings" class="settings-link" title="Login / Enable Auth" style="font-size:0.9em; margin-left: 20px;">Login</a>
+                <a href="/setup" class="settings-link" title="Login / Enable Auth" style="font-size:0.9em; margin-left: 20px;">Login</a>
             {% else %}
                 <a href="/logout" class="settings-link" title="Logout" style="font-size:0.9em; margin-left: 20px;">Logout</a>
             {% endif %}
@@ -651,6 +844,35 @@ def api_search():
         print(f"Search Error: {e}")
         return jsonify([])
 
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    cfg = get_config()
+    if 'AUTH_USER' in cfg and cfg['AUTH_USER']:
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        confirm = request.form['confirm_password']
+        
+        if password != confirm:
+            flash("Passwords do not match.")
+        elif len(password) < 4:
+            flash("Password must be at least 4 characters.")
+        else:
+            cfg['AUTH_USER'] = username
+            cfg['AUTH_HASH'] = generate_password_hash(password)
+            cfg['AUTH_DISABLED'] = False
+            save_config(cfg)
+            flash("Account created! Please login.")
+            return redirect(url_for('login'))
+
+    return render_template_string(HTML_LOGIN_SETUP, 
+                                  title="Setup Admin", 
+                                  subtitle="Create your admin account to secure access.",
+                                  btn_text="Create Account",
+                                  is_setup=True)
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     cfg = get_config()
@@ -710,6 +932,7 @@ def settings():
             cfg['PLEX_TOKEN'] = request.form.get('plex_token', '').strip()
             cfg['DOWNLOAD_BASE_DIR'] = request.form.get('download_dir', 'downloaded_posters').strip()
             cfg['HISTORY_FILE'] = request.form.get('history_file', 'download_history.json').strip()
+            cfg['ASSET_STYLE'] = request.form.get('asset_style', 'ASSET_FOLDERS')
             
             # Update Ignored Libraries from Checkboxes
             # getlist returns a list of values from checked boxes
@@ -724,7 +947,23 @@ def settings():
                 return redirect(url_for('home'))
             else:
                 flash("Settings saved, but could not connect to Plex. Check URL and Token.")
-                
+        
+        elif action == 'migrate_assets':
+            # Perform Migration
+            target_style = request.form.get('target_style')
+            count, error = perform_migration(target_style)
+            if error and isinstance(error, list) and len(error) > 0:
+                flash(f"Migrated {count} files. Errors: {len(error)} files failed.")
+                print(error) # Log errors to console
+            elif error:
+                flash(f"Migration Failed: {error}")
+            else:
+                flash(f"Successfully migrated {count} files to {target_style} structure.")
+            
+            # Update config to match migration
+            cfg['ASSET_STYLE'] = target_style
+            save_config(cfg)
+            
         elif action == 'change_password':
             current_pw = request.form.get('current_password')
             new_pw = request.form.get('new_password')
@@ -808,6 +1047,17 @@ def settings():
                     <input type="text" name="download_dir" value="{{ cfg.DOWNLOAD_BASE_DIR }}">
                 </div>
                 <div class="form-group">
+                    <label>Asset Folder Style</label>
+                    <select name="asset_style">
+                        <option value="ASSET_FOLDERS" {% if cfg.ASSET_STYLE == 'ASSET_FOLDERS' %}selected{% endif %}>Asset Folders (Kometa Default)</option>
+                        <option value="NO_ASSET_FOLDERS" {% if cfg.ASSET_STYLE == 'NO_ASSET_FOLDERS' %}selected{% endif %}>No Asset Folders (Flat)</option>
+                    </select>
+                    <small style="color:var(--text-muted); display:block; margin-top:5px;">
+                        <strong>Asset Folders:</strong> Movies/Show Name/poster.jpg<br>
+                        <strong>No Asset Folders:</strong> Movies/Movie Name.jpg
+                    </small>
+                </div>
+                <div class="form-group">
                     <label>History File Name</label>
                     <input type="text" name="history_file" value="{{ cfg.HISTORY_FILE }}">
                 </div>
@@ -834,6 +1084,24 @@ def settings():
                 </div>
                 
                 <button type="submit" class="btn">Save & Connect</button>
+            </form>
+        </div>
+        
+        <!-- MIGRATION TOOLS -->
+        <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none; margin-bottom: 30px;">
+            <h2 style="margin-top:0;">File Structure Migration</h2>
+            <p style="color:var(--text-muted);">Convert existing downloaded posters to a new folder structure. This scans all items in your Plex libraries and moves local files if found.</p>
+            
+            <form method="post" onsubmit="return confirm('This will move/rename files in your download directory. This might take a while. Continue?');">
+                <input type="hidden" name="action" value="migrate_assets">
+                <div class="form-group">
+                    <label>Convert To:</label>
+                    <select name="target_style">
+                        <option value="ASSET_FOLDERS">Asset Folders (Folders per item)</option>
+                        <option value="NO_ASSET_FOLDERS">No Asset Folders (Flat in Library)</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn">Migrate Files</button>
             </form>
         </div>
         
@@ -971,65 +1239,49 @@ def view_library(lib_id):
     
     # Use search to fetch only the needed slice.
     total_items = lib.totalSize
-    # FIX: Use container_start and maxresults for pagination instead of offset/limit
     items = lib.search(maxresults=per_page, container_start=offset)
     
     total_pages = math.ceil(total_items / per_page)
     
     # 1. Load History (Manual Completions + Downloads)
     history = load_history_data()
-    # Combine downloads and overrides into a set of unique keys (strings)
     all_history_keys = list(history['downloads'].keys()) + list(history['overrides'])
     history_keys_set = set(all_history_keys)
     
     # 2. Fetch "Global Done" items from history
-    # We must ensure we only fetch valid keys that belong to this library section
-    # Plex search can filter by id list.
     valid_keys = [int(k) for k in history_keys_set if k.isdigit()]
-    
-    # We use a broad try-catch because if history contains keys from other libraries, search might not return them, which is fine.
     done_objects_from_history = []
     if valid_keys:
         try:
-            # Search strictly within this library for these keys
             done_objects_from_history = lib.search(id=valid_keys)
-        except Exception as e:
-            # print(f"Error fetching history items: {e}")
+        except:
             pass
 
-    # Create a set of Done Rating Keys for easy lookup
     done_ids_map = {item.ratingKey: item for item in done_objects_from_history}
 
-    # Categories
     todo_items = []
     partial_items = []
     
-    # 3. Process the CURRENT PAGE items (Missing candidates)
+    # 3. Process the CURRENT PAGE items
     for i in items:
-        # Check actual status on disk
         status = get_item_status(i, lib.title)
         
-        # If it's complete, ensure it's in our "Done" list (even if not in history file yet)
         if status == 'complete':
             if i.ratingKey not in done_ids_map:
                 done_ids_map[i.ratingKey] = i
         elif status == 'partial':
-            # Reverted: use direct thumbUrl, let browser handle it.
             thumb = i.thumbUrl if i.thumb else ''
             partial_items.append({'title': i.title, 'ratingKey': i.ratingKey, 'thumbUrl': thumb})
         else:
-            # missing
             thumb = i.thumbUrl if i.thumb else ''
             todo_items.append({'title': i.title, 'ratingKey': i.ratingKey, 'thumbUrl': thumb})
 
     # 4. Construct the Final "Already Downloaded" list
-    # This list contains (History Items + Page items that are done)
     done_items_list = []
     for key, item in done_ids_map.items():
         thumb = item.thumbUrl if item.thumb else ''
         done_items_list.append({'title': item.title, 'ratingKey': item.ratingKey, 'thumbUrl': thumb})
         
-    # Sort done items alphabetically by title
     done_items_list.sort(key=lambda x: x['title'])
 
     pagination_block = """
@@ -1128,7 +1380,6 @@ def view_item(rating_key):
 
     is_show = item.type == 'show'
     posters = item.posters()
-    folder_name = get_physical_folder_name(item)
     lib = item.section()
     
     selected_url = get_history_url(rating_key)
@@ -1138,11 +1389,18 @@ def view_item(rating_key):
     if is_show:
         seasons = item.seasons()
     
+    # Calculate target display path based on current settings
+    target_path = get_target_file_path(item, lib.title)
+    # Simplify for display (remove base dir)
     cfg = get_config()
     base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
+    if not os.path.isabs(base_dir) and DATA_DIR != '.':
+        base_dir = os.path.join(DATA_DIR, base_dir)
+        
+    rel_path = os.path.relpath(target_path, base_dir) if target_path else "Unknown"
 
     content = """
-        <div class="path-info">Target: <strong>{{ base_dir }}/{{ lib_title }}/{{ folder_name }}</strong></div>
+        <div class="path-info">Target: <strong>.../{{ rel_path }}</strong></div>
         
         <div class="poster-grid">
             {% for poster in posters %}
@@ -1176,8 +1434,7 @@ def view_item(rating_key):
     """
     return render_template_string(HTML_TOP + content + HTML_BOTTOM, 
         item=item, is_show=is_show, posters=posters, seasons=seasons, 
-        folder_name=folder_name, lib_title=lib.title,
-        base_dir=base_dir,
+        rel_path=rel_path, lib_title=lib.title,
         poster_url=get_poster_url, 
         season_thumb=lambda s: s.thumbUrl,
         selected_url=selected_url,
@@ -1195,15 +1452,19 @@ def view_season(rating_key):
     posters = season.posters()
     lib = show.section()
     
-    show_folder = get_physical_folder_name(show)
-    season_folder = get_physical_folder_name(season)
     selected_url = get_history_url(rating_key)
 
+    target_path = get_target_file_path(season, lib.title)
+    
     cfg = get_config()
     base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
+    if not os.path.isabs(base_dir) and DATA_DIR != '.':
+        base_dir = os.path.join(DATA_DIR, base_dir)
+    
+    rel_path = os.path.relpath(target_path, base_dir) if target_path else "Unknown"
 
     content = """
-        <div class="path-info">Target: <strong>{{ base_dir }}/{{ lib_title }}/{{ show_folder }}/{{ season_folder }}</strong></div>
+        <div class="path-info">Target: <strong>.../{{ rel_path }}</strong></div>
         
         <div class="poster-grid">
             {% for poster in posters %}
@@ -1222,8 +1483,7 @@ def view_season(rating_key):
     """
     return render_template_string(HTML_TOP + content + HTML_BOTTOM, 
         show=show, season=season, posters=posters, 
-        show_folder=show_folder, season_folder=season_folder, lib_title=lib.title,
-        base_dir=base_dir,
+        rel_path=rel_path, lib_title=lib.title,
         poster_url=get_poster_url,
         selected_url=selected_url,
         title=f"{show.title} - {season.title}",
@@ -1243,19 +1503,25 @@ def download():
     try:
         item = plex.fetchItem(int(rating_key))
         lib_title = item.section().title
-        save_path = get_save_path_for_item(item, lib_title)
+        
+        # New: Get the exact target file path (directory + filename)
+        save_path = get_target_file_path(item, lib_title)
+        
+        if not save_path:
+            flash("Error: Could not determine save path.")
+            return redirect(request.referrer)
 
-        os.makedirs(save_path, exist_ok=True)
-        full_path = os.path.join(save_path, "poster.jpg")
+        # Create directories
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         r = requests.get(img_url, stream=True)
         if r.status_code == 200:
-            with open(full_path, 'wb') as f:
+            with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(1024):
                     f.write(chunk)
             
             save_download_history(rating_key, img_url)
-            flash(f"Saved poster to: {full_path}")
+            flash(f"Saved poster to: {save_path}")
         else:
             flash("Failed to download image from Plex.")
             
@@ -1289,6 +1555,3 @@ if __name__ == '__main__':
     print(f"Starting WebUI on http://0.0.0.0:5000")
     print(f"Go to Settings to configure Plex connection.")
     app.run(host='0.0.0.0', port=5000, debug=True)
-
-
-
