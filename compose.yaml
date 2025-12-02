@@ -1,14 +1,14 @@
 services:
   plex-poster-downloader:
     image: ghcr.io/johnfawkes/plex-poster-downloader:latest
-    container_name: plex-poster-manager
+    container_name: plex-poster-downloader
     restart: unless-stopped
     ports:
       - "5000:5000"
     volumes:
       # Persist configuration and history
       - ./config:/app/config
-      # Map the download folder to your local machine
+      # If using with Kometa, change the first downloaded_posters to the asset directory for kometa
       - ./downloaded_posters:/app/downloaded_posters
     environment:
       # Tell the app where to look for data (matches the volume above)
