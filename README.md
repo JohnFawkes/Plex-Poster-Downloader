@@ -1,14 +1,16 @@
 ## 🎬 Plex Poster Downloader & Manager
 
-A self-hosted web application that allows you to easily browse your Plex libraries and download local poster artwork (poster.jpg) directly to your media folders.
+A self-hosted web application that allows you to easily browse your Plex libraries and download local poster artwork (poster.jpg or asset-styled filenames) directly to your media folders.
 
-This tool is perfect for users who want to switch to "Local Assets" agents or simply want a backup of their curated artwork stored alongside their media files.
+This tool is perfect for users who want to switch to "Local Assets" agents, use tools like Kometa (formerly PMM), or simply want a backup of their curated artwork stored alongside their media files.
 
 ## ✨ Features
 
-* **Plex-Themed Web UI**: A dark, responsive interface designed to feel like home for Plex users.
+* **Plex-Themed Web UI:** A dark, responsive interface designed to feel like home for Plex users.
 
-* **Smart Folder Detection: Automatically saves images to poster.jpg inside the correct Movie, Show, or Season folder on your disk.
+* **Flexible Asset Structures:** Support for both Asset Folders (Kometa style) and Flat naming conventions.
+
+* **Migration Tool:** Built-in utility to scan and convert your existing downloaded posters between folder structures.
 
 * **Download Tracking:**
 
@@ -24,7 +26,7 @@ This tool is perfect for users who want to switch to "Local Assets" agents or si
 
     * Paginated views for large libraries.
 
-    * **Ability to hide/ignore specific libraries via Settings.
+    * **Hidden Libraries:** Easily hide specific libraries (like 4K or Home Videos) via the Settings checklist.
 
 * **Global Search:** Instantly search for movies or shows across all libraries with autocomplete suggestions.
 
@@ -134,19 +136,25 @@ On the first launch, you will be redirected to the Settings page.
 
 ## 📂 **Folder Structure Logic**
 
-The script attempts to replicate your physical folder structure based on the file paths Plex reports.
-This is to ensure compatibility with Kometa for assets.
-To see the different ways Kometa looks at folder structure see [here](https://kometa.wiki/en/latest/kometa/guides/assets/)
+This tool supports two different naming conventions for saving posters. You can switch between them in Settings and use the Migrate Files tool to automatically reorganize your existing downloads.
 
-**Example Download Paths:**
+1. **Asset Folders:**
 
-  * **Movie:** ``[BaseDir]/Movies/Avatar (2009)/poster.jpg``
+    * **Movies:** ``[BaseDir]/Library Name/Movie Name/poster.jpg``
 
-  * **Show:** ``[BaseDir]/TV Shows/The Office/poster.jpg``
+    * **Shows:** ``[BaseDir]/Library Name/Show Name/poster.jpg``
 
-  * **Season:** ``[BaseDir]/TV Shows/The Office/Season 01/poster.jpg``
+    * **Seasons:** ``[BaseDir]/Library Name/Show Name/Season01.jpg``
 
-Note: The script creates folders if they don't exist.
+2. **No Asset Folders (Flat):**
+
+    * **Movies:** ``[BaseDir]/Library Name/Movie Name.jpg``
+
+    * **Shows:** ``[BaseDir]/Library Name/Show Name.jpg``
+
+    * **Seasons:** ``[BaseDir]/Library Name/Show Name_Season01.jpg``
+
+***Note: The script creates folders if they don't exist.***
 
 ## 🛠️ **Troubleshooting**
 
