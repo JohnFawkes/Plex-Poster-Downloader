@@ -136,6 +136,7 @@ On the first launch, you will be redirected to the Settings page.
 
 The script attempts to replicate your physical folder structure based on the file paths Plex reports.
 This is to ensure compatibility with Kometa for assets.
+To see the different ways Kometa looks at folder structure see [here](https://kometa.wiki/en/latest/kometa/guides/assets/)
 
 **Example Download Paths:**
 
