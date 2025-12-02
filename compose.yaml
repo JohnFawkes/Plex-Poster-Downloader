@@ -8,7 +8,7 @@ services:
     volumes:
       # Persist configuration and history
       - ./config:/app/config
-      # Map the download folder to your local machine
+      # If using with Kometa, change the first downloaded_posters to the asset directory for kometa
       - ./downloaded_posters:/app/downloaded_posters
     environment:
       # Tell the app where to look for data (matches the volume above)
