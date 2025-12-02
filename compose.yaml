@@ -1,7 +1,7 @@
 services:
   plex-poster-downloader:
     image: ghcr.io/johnfawkes/plex-poster-downloader:latest
-    container_name: plex-poster-manager
+    container_name: plex-poster-downloader
     restart: unless-stopped
     ports:
       - "5000:5000"
