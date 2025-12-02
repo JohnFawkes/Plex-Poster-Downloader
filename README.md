@@ -34,6 +34,25 @@ This tool is perfect for users who want to switch to "Local Assets" agents, use 
 
 * **Manual Override:** Toggle items as "Complete" manually if you don't want to download a poster for them.
 
+## **📷Screenshots**
+
+* **Settings**
+![Settings](screenshots/settings1.png)
+![Settings](screenshots/settings2.png)
+![Settings](screenshots/settings3.png)
+
+* **Homepage**
+![Homepage](screenshots/homepage.png)
+
+* **Library**
+![Library](screenshots/library.png)
+
+* **Posters**
+![Downloaded](screenshots/downloaded.png)
+![Posters](screenshots/posters.png)
+![Seasons](screenshots/seasons.png)
+![Seasons](screenshots/seasons2.png)
+
 ## **🐳 Docker Installation (Recommended)**
 
 The easiest way to run this application is using Docker.
