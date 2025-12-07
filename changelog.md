@@ -2,7 +2,13 @@
 
 All notable changes to the Plex Poster Downloader project will be documented in this file.
 
-## [v0.7.0] - Current Version
+## [v0.7.1] - UX Fixes
+
+## Changed
+
+* Settings UX: The "Provider Name" dropdown is now automatically disabled and dimmed when "Random (No Uploads)" mode is selected, preventing configuration errors.
+
+## [v0.7.0]
 
 ## Added
 

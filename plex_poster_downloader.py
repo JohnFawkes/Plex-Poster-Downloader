@@ -30,12 +30,12 @@ DEFAULT_CONFIG = {
     'IGNORED_LIBRARIES': [],
     'ASSET_STYLE': 'ASSET_FOLDERS',
     'CRON_ENABLED': False,
-    'CRON_DAY': 'DAILY',    # DAILY, MONDAY, TUESDAY, etc.
     'CRON_TIME': '03:00',
+    'CRON_DAY': 'DAILY',
     'CRON_MODE': 'RANDOM',
     'CRON_PROVIDER': 'tmdb',
     'CRON_DOWNLOAD_BACKGROUNDS': False,
-    'VERBOSE_LOGGING': False, # Renamed from CRON_LOGGING to GLOBAL
+    'VERBOSE_LOGGING': False,
     'CRON_LIBRARIES': []
 }
 
@@ -429,11 +429,21 @@ cron_thread.start()
 @app.before_request
 def require_auth():
     log_verbose(f"Request: {request.method} {request.path} from {request.remote_addr}")
-    if request.endpoint in ['static', 'login', 'setup', 'logout', 'settings']: return
+    # Fix: Added 'settings' to the allow list to prevent redirect loops during setup
+    if request.endpoint in ['static', 'login', 'setup', 'logout', 'settings']:
+        return
+
     cfg = get_config()
-    if cfg.get('AUTH_DISABLED', False): return
-    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']: return redirect(url_for('settings'))
-    if 'user' not in session: return redirect(url_for('login'))
+    
+    if cfg.get('AUTH_DISABLED', False):
+        return
+    
+    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']:
+        return redirect(url_for('settings'))
+    
+    if 'user' not in session:
+        return redirect(url_for('login'))
+    
     session.permanent = True
 
 @app.errorhandler(404)
@@ -586,6 +596,27 @@ HTML_TOP = """
         document.getElementById(tabId).style.display = 'block';
         document.querySelector(`button[onclick="switchTab('${tabId}')"]`).classList.add('active');
     }
+    
+    function updateCronUI() {
+        const mode = document.querySelector('select[name="cron_mode"]').value;
+        const providerDiv = document.getElementById('cron_provider_div');
+        const providerInput = document.querySelector('select[name="cron_provider"]');
+        
+        if (mode === 'RANDOM') {
+            providerInput.disabled = true;
+            providerDiv.style.opacity = '0.4';
+        } else {
+            providerInput.disabled = false;
+            providerDiv.style.opacity = '1.0';
+        }
+    }
+    
+    // Run on load
+    window.addEventListener('DOMContentLoaded', () => {
+        if(document.querySelector('select[name="cron_mode"]')) {
+            updateCronUI();
+        }
+    });
     </script>
 </head>
 <body>
@@ -962,14 +993,14 @@ def settings():
                             </div>
                         {% endif %}
                     </div>
-                    <div class="form-group"><label>Mode</label>
-                        <select name="cron_mode">
+                    <div class="form-group"><label>Selection Mode</label>
+                        <select name="cron_mode" onchange="updateCronUI()">
                             <option value="RANDOM" {% if cfg.CRON_MODE == 'RANDOM' %}selected{% endif %}>Random (No Uploads)</option>
                             <option value="SPECIFIC_PROVIDER" {% if cfg.CRON_MODE == 'SPECIFIC_PROVIDER' %}selected{% endif %}>First from Provider</option>
                             <option value="RANDOM_PROVIDER" {% if cfg.CRON_MODE == 'RANDOM_PROVIDER' %}selected{% endif %}>Random from Provider</option>
                         </select>
                     </div>
-                    <div class="form-group"><label>Provider Name</label>
+                    <div class="form-group" id="cron_provider_div"><label>Provider Name</label>
                         <select name="cron_provider">
                             <option value="tmdb" {% if cfg.CRON_PROVIDER == 'tmdb' %}selected{% endif %}>TMDB</option>
                             <option value="tvdb" {% if cfg.CRON_PROVIDER == 'tvdb' %}selected{% endif %}>TVDB</option>
