@@ -198,6 +198,7 @@ The app generates a new secret key on every restart for security. If you restart
 
 * Add support for titlecards
 * Add support for logos
-* Add support for backgrounds
+* Add Squareart support
+* ~~Add support for backgrounds~~
 * Maybe add manual upploading of assets to the webui for ease of use when you may not have access to the internal filesystem to place them manully
 * Add a viewer for just the locally downloaded posters. Seperate it out from the downloader
