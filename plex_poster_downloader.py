@@ -11,6 +11,7 @@ import random
 import datetime
 from datetime import timedelta
 from flask import Flask, render_template_string, request, redirect, flash, url_for, session, jsonify
+import plexapi
 from plexapi.server import PlexServer
 from plexapi.exceptions import NotFound, Unauthorized
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -122,10 +123,17 @@ def init_plex():
     cfg = get_config()
     url = cfg.get('PLEX_URL')
     token = cfg.get('PLEX_TOKEN')
+    
     if not url or not token:
         plex = None
         log_verbose("Plex not configured.")
         return False
+
+    # Set custom identifier if provided (prevents new device on every restart)
+    custom_id = os.environ.get('PLEXAPI_HEADER_IDENTIFIER')
+    if custom_id:
+        plexapi.X_PLEX_IDENTIFIER = custom_id
+
     try:
         plex = PlexServer(url, token)
         print(f"Connected to Plex Server: {plex.friendlyName}")
@@ -484,11 +492,21 @@ cron_thread.start()
 @app.before_request
 def require_auth():
     log_verbose(f"Request: {request.method} {request.path} from {request.remote_addr}")
-    if request.endpoint in ['static', 'login', 'setup', 'logout', 'settings']: return
+    # Fix: Added 'settings' to the allow list to prevent redirect loops during setup
+    if request.endpoint in ['static', 'login', 'setup', 'logout', 'settings']:
+        return
+
     cfg = get_config()
-    if cfg.get('AUTH_DISABLED', False): return
-    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']: return redirect(url_for('settings'))
-    if 'user' not in session: return redirect(url_for('login'))
+    
+    if cfg.get('AUTH_DISABLED', False):
+        return
+    
+    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']:
+        return redirect(url_for('settings'))
+    
+    if 'user' not in session:
+        return redirect(url_for('login'))
+    
     session.permanent = True
 
 @app.errorhandler(404)
@@ -845,7 +863,7 @@ def settings():
             cfg['PLEX_URL'] = request.form.get('plex_url', '').strip()
             # Handle Token Update: Only update if not the placeholder
             token_input = request.form.get('plex_token', '').strip()
-            if token_input:
+            if token_input != '(Encrypted)':
                 cfg['PLEX_TOKEN'] = token_input
             
             cfg['DOWNLOAD_BASE_DIR'] = request.form.get('download_dir', 'downloaded_posters').strip()

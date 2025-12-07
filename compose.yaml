@@ -13,3 +13,5 @@ services:
     environment:
       # Tell the app where to look for data (matches the volume above)
       - DATA_DIR=/app/config
+      # Identify the device connecting to plex
+      - PLEXAPI_HEADER_IDENTIFIER=plex-poster-downloader

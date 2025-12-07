@@ -10,6 +10,8 @@ All notable changes to the Plex Poster Downloader project will be documented in 
 
 * **UI Security:** The Plex Token input in the Settings menu is now masked ((Encrypted)). Users must click a "Change" button to unlock the field and overwrite the token, preventing accidental exposure or modification.
 
+* **Device Identity:** Added support for the PLEXAPI_HEADER_IDENTIFIER environment variable. This allows Docker users to set a static identifier, preventing a new "device" from being registered in Plex every time the container restarts.
+
 ## Changed
 
 * **Config Handling:** config.json now stores the Plex Token in an encrypted format. It is automatically decrypted in memory when the application runs.
