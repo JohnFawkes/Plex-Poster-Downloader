@@ -2,6 +2,16 @@
 
 All notable changes to the Plex Poster Downloader project will be documented in this file.
 
+## [v0.7.3] - Timezones & Scheduling UX
+
+## Added
+
+* **Cron Timezones:** Added support for specifying a timezone (e.g., America/New_York) for the automated scheduler. Defaults to System Local time.
+
+* **Day Selection:** Added the ability to run the Cron job on a specific day of the week (e.g., "Every Friday") or Daily.
+
+* **Enhanced Time Picker:** Replaced the manual text input for Cron time with user-friendly Hour, Minute, and AM/PM dropdowns.
+
 ## [v0.7.2] - Security & Encryption
 
 ## Added

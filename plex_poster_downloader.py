@@ -9,9 +9,15 @@ import threading
 import time
 import random
 import datetime
+# Try to import ZoneInfo for timezone support (Python 3.9+)
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Fallback/Mock if missing (though standard in 3.11)
+    ZoneInfo = None
+
 from datetime import timedelta
 from flask import Flask, render_template_string, request, redirect, flash, url_for, session, jsonify
-import plexapi
 from plexapi.server import PlexServer
 from plexapi.exceptions import NotFound, Unauthorized
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -34,6 +40,8 @@ DEFAULT_CONFIG = {
     'ASSET_STYLE': 'ASSET_FOLDERS',
     'CRON_ENABLED': False,
     'CRON_TIME': '03:00',
+    'CRON_DAY': 'DAILY',
+    'CRON_TZ': 'Local', # New Timezone Setting
     'CRON_MODE': 'RANDOM',
     'CRON_PROVIDER': 'tmdb',
     'CRON_DOWNLOAD_BACKGROUNDS': False,
@@ -66,7 +74,6 @@ def decrypt_val(token):
         f = Fernet(get_encryption_key())
         return f.decrypt(token.encode()).decode()
     except:
-        # Fallback: return as is (useful for migration from plain text)
         return token
 
 def get_config():
@@ -75,12 +82,10 @@ def get_config():
     try:
         with open(CONFIG_FILE, 'r') as f:
             cfg = json.load(f)
-            # Ensure defaults for new keys
             for key, val in DEFAULT_CONFIG.items():
                 if key not in cfg:
                     cfg[key] = val
             
-            # Decrypt Token on Load
             if cfg['PLEX_TOKEN']:
                 cfg['PLEX_TOKEN'] = decrypt_val(cfg['PLEX_TOKEN'])
                 
@@ -89,13 +94,8 @@ def get_config():
         return DEFAULT_CONFIG
 
 def save_config(new_config):
-    # Deep copy to avoid modifying the runtime dict which might be used elsewhere
     cfg_to_save = new_config.copy()
-    
-    # Encrypt Token before Save
     if cfg_to_save['PLEX_TOKEN']:
-        # If it looks like it's already encrypted (Fernet tokens are long), check
-        # But for safety, we assume input is plain text from UI or memory
         cfg_to_save['PLEX_TOKEN'] = encrypt_val(cfg_to_save['PLEX_TOKEN'])
 
     with open(CONFIG_FILE, 'w') as f:
@@ -123,15 +123,14 @@ def init_plex():
     cfg = get_config()
     url = cfg.get('PLEX_URL')
     token = cfg.get('PLEX_TOKEN')
-    
     if not url or not token:
         plex = None
         log_verbose("Plex not configured.")
         return False
 
-    # Set custom identifier if provided (prevents new device on every restart)
     custom_id = os.environ.get('PLEXAPI_HEADER_IDENTIFIER')
     if custom_id:
+        import plexapi
         plexapi.X_PLEX_IDENTIFIER = custom_id
 
     try:
@@ -465,17 +464,25 @@ def scheduler_loop():
         cfg = get_config()
         if cfg.get('CRON_ENABLED'):
             target_time = cfg.get('CRON_TIME', '03:00')
-            target_day = cfg.get('CRON_DAY', 'DAILY') # DAILY, MONDAY, etc.
+            target_day = cfg.get('CRON_DAY', 'DAILY')
+            target_tz = cfg.get('CRON_TZ', 'Local')
             
-            now = datetime.datetime.now()
+            # Determine "Now" based on Timezone
+            try:
+                if target_tz and target_tz != 'Local' and ZoneInfo:
+                    now = datetime.datetime.now(ZoneInfo(target_tz))
+                else:
+                    now = datetime.datetime.now()
+            except Exception:
+                # Fallback to local if TZ is invalid
+                now = datetime.datetime.now()
+
             current_time = now.strftime("%H:%M")
             current_day_name = now.strftime("%A").upper()
             current_date = now.date()
             
-            # Check Day of Week
             day_match = (target_day == 'DAILY') or (target_day == current_day_name)
             
-            # Check Time + Day + Not already run today
             if day_match and current_time == target_time and last_run_date != current_date:
                 run_cron_job()
                 last_run_date = current_date
@@ -561,11 +568,11 @@ CSS_COMMON = """
     .background-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 25px; }
     .poster-card { background: var(--card); padding: 10px; border-radius: 12px; text-align: center; position: relative; border: 4px solid transparent; transition: 0.2s; }
     .img-container { position: relative; overflow: hidden; border-radius: 8px; }
-    .poster-card img { width: 100%; border-radius: 8px; }
+    .poster-card img { width: 100%; height: auto; aspect-ratio: 2/3; object-fit: cover; display: block; border-radius: 8px; }
     .poster-card:hover { background: #333333; border-color: var(--accent); }
     .poster-card.selected { border-color: var(--accent); background: rgba(229, 160, 13, 0.1); }
     .background-card { background: var(--card); padding: 10px; border-radius: 12px; text-align: center; position: relative; border: 4px solid transparent; transition: 0.2s; }
-    .background-card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; border-radius: 8px; }
+    .background-card img { width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; display: block; border-radius: 8px; }
     .background-card:hover { background: #333333; border-color: var(--accent); }
     .background-card.selected { border-color: var(--accent); background: rgba(229, 160, 13, 0.1); }
     .selected-badge { position: absolute; top: 8px; right: 8px; background: var(--accent); color: var(--btn-text); padding: 5px 12px; border-radius: 20px; font-weight: 800; font-size: 0.8em; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
@@ -863,7 +870,7 @@ def settings():
             cfg['PLEX_URL'] = request.form.get('plex_url', '').strip()
             # Handle Token Update: Only update if not the placeholder
             token_input = request.form.get('plex_token', '').strip()
-            if token_input != '(Encrypted)':
+            if token_input and token_input != '(Encrypted)':
                 cfg['PLEX_TOKEN'] = token_input
             
             cfg['DOWNLOAD_BASE_DIR'] = request.form.get('download_dir', 'downloaded_posters').strip()
@@ -886,6 +893,8 @@ def settings():
             
             cfg['CRON_DAY'] = day
             cfg['CRON_TIME'] = f"{h_24:02d}:{m:02d}"
+            
+            cfg['CRON_TZ'] = request.form.get('cron_tz', 'Local').strip()
 
             cfg['CRON_MODE'] = request.form.get('cron_mode', 'RANDOM')
             cfg['CRON_PROVIDER'] = request.form.get('cron_provider', '').strip()
@@ -1032,8 +1041,8 @@ def settings():
                         <label for="cron_download_backgrounds" style="margin:0;">Download Backgrounds</label>
                     </div>
 
-                    <div class="form-group" style="display: flex; gap: 20px;">
-                        <div style="flex: 1;">
+                    <div class="form-group" style="display: flex; gap: 20px; flex-wrap: wrap;">
+                        <div style="flex: 1; min-width: 150px;">
                             <label>Run On Day</label>
                             <select name="cron_day">
                                 <option value="DAILY" {% if cfg.CRON_DAY == 'DAILY' %}selected{% endif %}>Every Day</option>
@@ -1046,24 +1055,28 @@ def settings():
                                 <option value="SUNDAY" {% if cfg.CRON_DAY == 'SUNDAY' %}selected{% endif %}>Sunday</option>
                             </select>
                         </div>
-                        <div style="flex: 1;">
+                        <div style="flex: 1; min-width: 220px;">
                             <label>Run At</label>
                             <div style="display:flex; gap:10px;">
-                                <select name="cron_hour" style="flex:1;">
+                                <select name="cron_hour" style="flex:1; min-width: 60px;">
                                     {% for h in range(1, 13) %}
                                         <option value="{{ '%02d' % h }}" {% if ('%02d' % h) == c_hour %}selected{% endif %}>{{ h }}</option>
                                     {% endfor %}
                                 </select>
-                                <select name="cron_minute" style="flex:1;">
+                                <select name="cron_minute" style="flex:1; min-width: 60px;">
                                     {% for m in range(0, 60) %}
                                         <option value="{{ '%02d' % m }}" {% if ('%02d' % m) == c_minute %}selected{% endif %}>{{ '%02d' % m }}</option>
                                     {% endfor %}
                                 </select>
-                                <select name="cron_ampm" style="flex:1;">
+                                <select name="cron_ampm" style="flex:1; min-width: 60px;">
                                     <option value="AM" {% if c_ampm == 'AM' %}selected{% endif %}>AM</option>
                                     <option value="PM" {% if c_ampm == 'PM' %}selected{% endif %}>PM</option>
                                 </select>
                             </div>
+                        </div>
+                        <div style="flex: 1; min-width: 100px;">
+                            <label>Timezone</label>
+                            <input type="text" name="cron_tz" value="{{ cfg.CRON_TZ }}" placeholder="Local">
                         </div>
                     </div>
 
