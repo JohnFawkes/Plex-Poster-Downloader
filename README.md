@@ -1,6 +1,6 @@
 ## 🎬 Plex Poster Downloader & Manager
 
-A self-hosted web application that allows you to easily browse your Plex libraries and download local poster artwork (poster.jpg or asset-styled filenames) directly to your media folders.
+A self-hosted web application that allows you to easily browse your Plex libraries and download local poster artwork (poster.jpg) and backgrounds (background.jpg) to any local folder.
 
 This tool is perfect for users who want to switch to "Local Assets" agents, use tools like Kometa (formerly PMM), or simply want a backup of their curated artwork stored alongside their media files.
 
@@ -11,6 +11,24 @@ YOU HAVE BEEN WARNED.
 ## ✨ Features
 
 * **Plex-Themed Web UI:** A dark, responsive interface designed to feel like home for Plex users.
+
+* **Global Search:** Instantly search for movies or shows across all libraries with autocomplete suggestions.
+
+* **Background & Fanart Support:** Dedicated tabs to switch between Posters and Backgrounds.
+
+    * Download high-res backgrounds for Movies, Shows, and Seasons.
+
+    * Provider badges (TMDB, Fanart.tv, etc.) to see source quality.
+
+* **Automated Scheduler (Cron):**
+
+    * Schedule daily or weekly downloads (e.g., "Every Friday at 3:00 AM").
+
+    * Choose specific libraries to target.
+
+    * Modes: Random (fill missing spots), Specific Provider, or Random Provider.
+
+    * Option to auto-download backgrounds alongside posters.
 
 * **Flexible Asset Structures:** Support for both Asset Folders and Flat naming conventions.
 
@@ -31,8 +49,6 @@ YOU HAVE BEEN WARNED.
     * Paginated views for large libraries.
 
     * **Hidden Libraries:** Easily hide specific libraries (like 4K or Home Videos) via the Settings checklist.
-
-* **Global Search:** Instantly search for movies or shows across all libraries with autocomplete suggestions.
 
 * **Authentication:** Secure the interface with an admin username/password (can be disabled in Settings).
 
@@ -147,15 +163,9 @@ On the first launch, you will be redirected to the Settings page.
 
         * **Plex Server URL:** e.g., ``http://192.168.1.10:32400``
 
-        * **Plex Token:** Your X-Plex-Token. [How to find your token.](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
+        * **Plex Token:** Your X-Plex-Token. [How to find your token.](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token)
 
-  3. **Download Directory:**
-
-       * **Docker:** Leave as downloaded_posters (it maps to the internal path or).
-
-       * **Manual:** Set this to the root of your media drive (e.g., ``Z:\Media`` or ``/mnt/media``, or where ever you want to save the posters. If you want to use it with Kometa then put the location of the assets path for kometa).
-
-  4. **Hidden Libraries:** You can uncheck libraries you don't want to manage (e.g., Home Videos, Music).
+  3. **Hidden Libraries:** You can uncheck libraries you don't want to manage (e.g., Home Videos, Music).
 
 ## 📂 **Folder Structure Logic**
 
