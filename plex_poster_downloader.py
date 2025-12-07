@@ -14,12 +14,14 @@ from flask import Flask, render_template_string, request, redirect, flash, url_f
 from plexapi.server import PlexServer
 from plexapi.exceptions import NotFound, Unauthorized
 from werkzeug.security import generate_password_hash, check_password_hash
+from cryptography.fernet import Fernet
 
 # ==========================================
 # 1. CONFIGURATION MANAGEMENT
 # ==========================================
 DATA_DIR = os.environ.get('DATA_DIR', '.')
 CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
+KEY_FILE = os.path.join(DATA_DIR, '.secret.key')
 
 DEFAULT_CONFIG = {
     'PLEX_URL': 'http://127.0.0.1:32400',
@@ -31,7 +33,6 @@ DEFAULT_CONFIG = {
     'ASSET_STYLE': 'ASSET_FOLDERS',
     'CRON_ENABLED': False,
     'CRON_TIME': '03:00',
-    'CRON_DAY': 'DAILY',
     'CRON_MODE': 'RANDOM',
     'CRON_PROVIDER': 'tmdb',
     'CRON_DOWNLOAD_BACKGROUNDS': False,
@@ -39,22 +40,65 @@ DEFAULT_CONFIG = {
     'CRON_LIBRARIES': []
 }
 
+# --- Encryption Helpers ---
+def get_encryption_key():
+    """Gets or creates a symmetric encryption key."""
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, 'rb') as f:
+            return f.read()
+    else:
+        key = Fernet.generate_key()
+        with open(KEY_FILE, 'wb') as f:
+            f.write(key)
+        return key
+
+def encrypt_val(value):
+    """Encrypts a string value."""
+    if not value: return ""
+    f = Fernet(get_encryption_key())
+    return f.encrypt(value.encode()).decode()
+
+def decrypt_val(token):
+    """Decrypts a string value."""
+    if not token: return ""
+    try:
+        f = Fernet(get_encryption_key())
+        return f.decrypt(token.encode()).decode()
+    except:
+        # Fallback: return as is (useful for migration from plain text)
+        return token
+
 def get_config():
     if not os.path.exists(CONFIG_FILE):
         return DEFAULT_CONFIG
     try:
         with open(CONFIG_FILE, 'r') as f:
             cfg = json.load(f)
+            # Ensure defaults for new keys
             for key, val in DEFAULT_CONFIG.items():
                 if key not in cfg:
                     cfg[key] = val
+            
+            # Decrypt Token on Load
+            if cfg['PLEX_TOKEN']:
+                cfg['PLEX_TOKEN'] = decrypt_val(cfg['PLEX_TOKEN'])
+                
             return cfg
     except:
         return DEFAULT_CONFIG
 
 def save_config(new_config):
+    # Deep copy to avoid modifying the runtime dict which might be used elsewhere
+    cfg_to_save = new_config.copy()
+    
+    # Encrypt Token before Save
+    if cfg_to_save['PLEX_TOKEN']:
+        # If it looks like it's already encrypted (Fernet tokens are long), check
+        # But for safety, we assume input is plain text from UI or memory
+        cfg_to_save['PLEX_TOKEN'] = encrypt_val(cfg_to_save['PLEX_TOKEN'])
+
     with open(CONFIG_FILE, 'w') as f:
-        json.dump(new_config, f, indent=2)
+        json.dump(cfg_to_save, f, indent=2)
 
 def log_verbose(msg):
     """Global logging helper."""
@@ -310,16 +354,27 @@ def get_library_stats(lib):
     clean_lib = sanitize_filename(lib.title)
     lib_dir = os.path.join(base_dir, clean_lib)
     
+    file_count = 0
+    bg_count = 0
+    total_size = 0
+    
     if os.path.exists(lib_dir):
         for root, dirs, files in os.walk(lib_dir):
             for f in files:
                 if f.lower().endswith('.jpg') or f.lower().endswith('.png'):
                     fp = os.path.join(root, f)
-                    stats['disk_size'] += os.path.getsize(fp)
-                    if 'background' in f.lower(): stats['bg_downloaded_count'] += 1
-                    else: stats['downloaded_count'] += 1
+                    total_size += os.path.getsize(fp)
+                    
+                    # Detect backgrounds
+                    if 'background' in f.lower():
+                        bg_count += 1
+                    else:
+                        file_count += 1
     
-    stats['size_str'] = format_size(stats['disk_size'])
+    stats['downloaded_count'] = file_count
+    stats['bg_downloaded_count'] = bg_count
+    stats['disk_size'] = total_size
+    stats['size_str'] = format_size(total_size)
     return stats
 
 # ==========================================
@@ -429,21 +484,11 @@ cron_thread.start()
 @app.before_request
 def require_auth():
     log_verbose(f"Request: {request.method} {request.path} from {request.remote_addr}")
-    # Fix: Added 'settings' to the allow list to prevent redirect loops during setup
-    if request.endpoint in ['static', 'login', 'setup', 'logout', 'settings']:
-        return
-
+    if request.endpoint in ['static', 'login', 'setup', 'logout', 'settings']: return
     cfg = get_config()
-    
-    if cfg.get('AUTH_DISABLED', False):
-        return
-    
-    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']:
-        return redirect(url_for('settings'))
-    
-    if 'user' not in session:
-        return redirect(url_for('login'))
-    
+    if cfg.get('AUTH_DISABLED', False): return
+    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']: return redirect(url_for('settings'))
+    if 'user' not in session: return redirect(url_for('login'))
     session.permanent = True
 
 @app.errorhandler(404)
@@ -611,7 +656,6 @@ HTML_TOP = """
         }
     }
     
-    // Run on load
     window.addEventListener('DOMContentLoaded', () => {
         if(document.querySelector('select[name="cron_mode"]')) {
             updateCronUI();
@@ -799,7 +843,11 @@ def settings():
         action = request.form.get('action')
         if action == 'update_config':
             cfg['PLEX_URL'] = request.form.get('plex_url', '').strip()
-            cfg['PLEX_TOKEN'] = request.form.get('plex_token', '').strip()
+            # Handle Token Update: Only update if not the placeholder
+            token_input = request.form.get('plex_token', '').strip()
+            if token_input:
+                cfg['PLEX_TOKEN'] = token_input
+            
             cfg['DOWNLOAD_BASE_DIR'] = request.form.get('download_dir', 'downloaded_posters').strip()
             cfg['HISTORY_FILE'] = request.form.get('history_file', 'download_history.json').strip()
             cfg['ASSET_STYLE'] = request.form.get('asset_style', 'ASSET_FOLDERS')
@@ -897,6 +945,11 @@ def settings():
     except:
         c_hour, c_minute, c_ampm = '03', '00', 'AM'
 
+    # Prepare config for display (mask token)
+    display_cfg = cfg.copy()
+    if display_cfg['PLEX_TOKEN']:
+        display_cfg['PLEX_TOKEN'] = '(Encrypted)'
+
     content = """
     <div style="max-width: 800px; margin: 0 auto;">
         <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none; margin-bottom: 30px;">
@@ -904,7 +957,22 @@ def settings():
             <form method="post">
                 <input type="hidden" name="action" value="update_config">
                 <div class="form-group"><label>Plex Server URL</label><input type="text" name="plex_url" value="{{ cfg.PLEX_URL }}" placeholder="http://localhost:32400"></div>
-                <div class="form-group"><label>Plex Token</label><input type="text" name="plex_token" value="{{ cfg.PLEX_TOKEN }}"></div>
+                
+                <div class="form-group">
+                    <label>Plex Token (X-Plex-Token)</label>
+                    {% if cfg.PLEX_TOKEN == '(Encrypted)' %}
+                        <div id="token-view" style="display:flex; gap:10px;">
+                            <input type="text" value="(Encrypted)" disabled style="background:#2a2a2a; border:1px solid #444; color:#888;">
+                            <button type="button" class="btn" style="width:auto; margin:0; padding:10px 20px;" onclick="document.getElementById('token-view').style.display='none'; document.getElementById('token-edit').style.display='block';">Change</button>
+                        </div>
+                        <div id="token-edit" style="display:none;">
+                            <input type="text" name="plex_token" placeholder="Enter new X-Plex-Token">
+                        </div>
+                    {% else %}
+                        <input type="text" name="plex_token" value="{{ cfg.PLEX_TOKEN }}" placeholder="Your Plex Token">
+                    {% endif %}
+                </div>
+
                 <div class="form-group"><label>Download Directory</label><input type="text" name="download_dir" value="{{ cfg.DOWNLOAD_BASE_DIR }}"></div>
                 <div class="form-group"><label>Asset Folder Style</label>
                     <select name="asset_style">
@@ -1062,7 +1130,7 @@ def settings():
         </div>
     </div>
     """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=cfg, all_libs=all_libs, c_hour=c_hour, c_minute=c_minute, c_ampm=c_ampm, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=display_cfg, all_libs=all_libs, c_hour=c_hour, c_minute=c_minute, c_ampm=c_ampm, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
 
 @app.route('/library/<lib_id>')
 def view_library(lib_id):
