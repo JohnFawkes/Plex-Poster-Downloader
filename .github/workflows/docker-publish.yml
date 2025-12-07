@@ -25,15 +25,34 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # CHANGED: Required to create tags and releases
       packages: write
-      # This is used to complete the identity challenge
-      # with sigstore/fulcio when running outside of PRs.
       id-token: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # CHANGED: Required for version calculation history
+
+      # NEW: Bump version and push tag (Only on push to main)
+      - name: Bump version and push tag
+        id: tag_version
+        if: github.event_name == 'push'
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch # Default to patch version (v1.0.0 -> v1.0.1)
+
+      # NEW: Create a GitHub Release (Only on push to main)
+      - name: Create a GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
+          generate_release_notes: true
 
       # FIX: Force the image name to lowercase to avoid Docker registry errors
       - name: Lowercase Image Name
@@ -63,6 +82,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            # NEW: Add the specific version tag (e.g. v1.0.5) to the docker image
+            type=raw,value=${{ steps.tag_version.outputs.new_tag }},enable=${{ github.event_name == 'push' }}
             type=ref,event=branch
             type=ref,event=pr
             type=sha
@@ -72,7 +93,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

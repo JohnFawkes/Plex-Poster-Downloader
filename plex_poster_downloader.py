@@ -5,6 +5,10 @@ import json
 import requests
 import math
 import shutil
+import threading
+import time
+import random
+import datetime
 from datetime import timedelta
 from flask import Flask, render_template_string, request, redirect, flash, url_for, session, jsonify
 from plexapi.server import PlexServer
@@ -12,9 +16,8 @@ from plexapi.exceptions import NotFound, Unauthorized
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==========================================
-# CONFIGURATION MANAGEMENT
+# 1. CONFIGURATION MANAGEMENT
 # ==========================================
-# Support for Docker Volume Mapping
 DATA_DIR = os.environ.get('DATA_DIR', '.')
 CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
 
@@ -25,7 +28,15 @@ DEFAULT_CONFIG = {
     'HISTORY_FILE': os.path.join(DATA_DIR, 'download_history.json'),
     'AUTH_DISABLED': False,
     'IGNORED_LIBRARIES': [],
-    'ASSET_STYLE': 'ASSET_FOLDERS' # Options: 'ASSET_FOLDERS', 'NO_ASSET_FOLDERS'
+    'ASSET_STYLE': 'ASSET_FOLDERS',
+    'CRON_ENABLED': False,
+    'CRON_DAY': 'DAILY',    # DAILY, MONDAY, TUESDAY, etc.
+    'CRON_TIME': '03:00',
+    'CRON_MODE': 'RANDOM',
+    'CRON_PROVIDER': 'tmdb',
+    'CRON_DOWNLOAD_BACKGROUNDS': False,
+    'VERBOSE_LOGGING': False, # Renamed from CRON_LOGGING to GLOBAL
+    'CRON_LIBRARIES': []
 }
 
 def get_config():
@@ -34,7 +45,6 @@ def get_config():
     try:
         with open(CONFIG_FILE, 'r') as f:
             cfg = json.load(f)
-            # Ensure defaults for new keys
             for key, val in DEFAULT_CONFIG.items():
                 if key not in cfg:
                     cfg[key] = val
@@ -46,11 +56,17 @@ def save_config(new_config):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(new_config, f, indent=2)
 
+def log_verbose(msg):
+    """Global logging helper."""
+    cfg = get_config()
+    if cfg.get('VERBOSE_LOGGING', False):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] {msg}")
+
 # ==========================================
-# APP SETUP
+# 2. APP SETUP
 # ==========================================
 app = Flask(__name__)
-# Generate a random secret key on every start to invalidate old sessions
 app.secret_key = os.urandom(24)
 app.permanent_session_lifetime = timedelta(hours=1)
 
@@ -58,115 +74,44 @@ app.permanent_session_lifetime = timedelta(hours=1)
 plex = None
 
 def init_plex():
-    """Attempts to connect to Plex using current config."""
     global plex
     cfg = get_config()
     url = cfg.get('PLEX_URL')
     token = cfg.get('PLEX_TOKEN')
-    
     if not url or not token:
         plex = None
+        log_verbose("Plex not configured.")
         return False
-        
     try:
         plex = PlexServer(url, token)
         print(f"Connected to Plex Server: {plex.friendlyName}")
+        log_verbose(f"Successfully connected to {plex.friendlyName} at {url}")
         return True
     except Exception as e:
         print(f"Error connecting to Plex: {e}")
+        log_verbose(f"Connection Error: {e}")
         plex = None
         return False
 
-# Initialize on startup
 init_plex()
 
-# Inject server name into all templates
-@app.context_processor
-def inject_global_vars():
-    server_name = plex.friendlyName if plex else "Disconnected"
-    cfg = get_config()
-    auth_disabled = cfg.get('AUTH_DISABLED', False)
-    return dict(server_name=server_name, auth_disabled=auth_disabled)
-
 # ==========================================
-# AUTHENTICATION MIDDLEWARE
+# 3. HELPER FUNCTIONS (CORE)
 # ==========================================
-@app.before_request
-def require_auth():
-    if request.endpoint in ['static', 'login', 'setup', 'logout']:
-        return
 
-    cfg = get_config()
-    
-    if cfg.get('AUTH_DISABLED', False):
-        return
-    
-    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']:
-        return redirect(url_for('settings'))
-    
-    if 'user' not in session:
-        return redirect(url_for('login'))
-    
-    session.permanent = True
+def format_provider(provider_str):
+    if not provider_str: return "Upload"
+    p = str(provider_str).lower()
+    if 'themoviedb' in p or 'tmdb' in p: return "TMDB"
+    if 'thetvdb' in p or 'tvdb' in p: return "TVDB"
+    if 'imdb' in p: return "IMDB"
+    if 'fanart' in p: return "Fanart.tv"
+    if 'gracenote' in p: return "Plex/Gracenote"
+    if 'local' in p: return "Local"
+    if 'movieposterdb' in p: return "MoviePosterDB"
+    if '.' in p: return p.split('.')[-1].title()
+    return p.title()
 
-# ==========================================
-# HELPER: HISTORY & OVERRIDES
-# ==========================================
-def load_history_data():
-    cfg = get_config()
-    hist_file = cfg.get('HISTORY_FILE', 'download_history.json')
-    # Handle case where path is relative or absolute
-    if not os.path.isabs(hist_file) and DATA_DIR != '.':
-         hist_file = os.path.join(DATA_DIR, os.path.basename(hist_file))
-
-    if not os.path.exists(hist_file):
-        return {"downloads": {}, "overrides": []}
-    try:
-        with open(hist_file, 'r') as f:
-            data = json.load(f)
-            if "downloads" not in data: data["downloads"] = {}
-            if "overrides" not in data: data["overrides"] = []
-            return data
-    except:
-        return {"downloads": {}, "overrides": []}
-
-def save_history_data(data):
-    cfg = get_config()
-    hist_file = cfg.get('HISTORY_FILE', 'download_history.json')
-    if not os.path.isabs(hist_file) and DATA_DIR != '.':
-         hist_file = os.path.join(DATA_DIR, os.path.basename(hist_file))
-         
-    with open(hist_file, 'w') as f:
-        json.dump(data, f, indent=2)
-
-def save_download_history(rating_key, img_url):
-    data = load_history_data()
-    data["downloads"][str(rating_key)] = img_url
-    save_history_data(data)
-
-def get_history_url(rating_key):
-    data = load_history_data()
-    return data["downloads"].get(str(rating_key))
-
-def toggle_override_status(rating_key):
-    data = load_history_data()
-    rk_str = str(rating_key)
-    if rk_str in data["overrides"]:
-        data["overrides"].remove(rk_str)
-        status = False
-    else:
-        data["overrides"].append(rk_str)
-        status = True
-    save_history_data(data)
-    return status
-
-def is_overridden(rating_key):
-    data = load_history_data()
-    return str(rating_key) in data["overrides"]
-
-# ==========================================
-# HELPER: FILES & PATHS
-# ==========================================
 def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()
 
@@ -192,115 +137,62 @@ def get_physical_folder_name(item):
             else:
                 return f"Season {item.index}"
     except Exception as e:
-        print(f"Error resolving path for {item.title}: {e}")
+        log_verbose(f"Error resolving path for {item.title}: {e}")
         return "Unknown_Folder"
     return "Unknown_Type"
 
-def get_target_file_path(item, lib_title=None, style=None):
-    """
-    Returns the FULL target path (directory + filename) for a poster
-    based on the configured Asset Style.
-    """
+def get_target_file_path(item, lib_title=None, style=None, img_type='poster'):
     cfg = get_config()
     base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
     current_style = style if style else cfg.get('ASSET_STYLE', 'ASSET_FOLDERS')
     
-    # Handle relative paths for Docker
     if not os.path.isabs(base_dir) and DATA_DIR != '.':
         base_dir = os.path.join(DATA_DIR, base_dir)
         
     if not lib_title:
-        if hasattr(item, 'section'):
-             lib_title = item.section().title
+        if hasattr(item, 'section'): lib_title = item.section().title
         elif hasattr(item, 'librarySectionID'):
              lib = plex.library.sectionByID(item.librarySectionID)
              lib_title = lib.title
-        else:
-             lib_title = "Unknown_Library"
+        else: lib_title = "Unknown_Library"
              
     clean_lib = sanitize_filename(lib_title)
+    filename = "poster.jpg" if img_type == 'poster' else "background.jpg"
     
-    # MOVIE
     if item.type == 'movie':
-        folder_name = get_physical_folder_name(item) # e.g. "Avatar (2009)"
-        
+        folder_name = get_physical_folder_name(item) 
         if current_style == 'NO_ASSET_FOLDERS':
-            # Flat: Library/Movie Name.jpg
-            return os.path.join(base_dir, clean_lib, f"{folder_name}.jpg")
+            suffix = "" if img_type == 'poster' else "_background"
+            return os.path.join(base_dir, clean_lib, f"{folder_name}{suffix}.jpg")
         else:
-            # Asset Folders: Library/Movie Name/poster.jpg
-            return os.path.join(base_dir, clean_lib, folder_name, "poster.jpg")
+            return os.path.join(base_dir, clean_lib, folder_name, filename)
 
-    # SHOW
     elif item.type == 'show':
-        folder_name = get_physical_folder_name(item) # e.g. "The Office"
-        
+        folder_name = get_physical_folder_name(item)
         if current_style == 'NO_ASSET_FOLDERS':
-            # Flat: Library/Show Name.jpg
-            return os.path.join(base_dir, clean_lib, f"{folder_name}.jpg")
+            suffix = "" if img_type == 'poster' else "_background"
+            return os.path.join(base_dir, clean_lib, f"{folder_name}{suffix}.jpg")
         else:
-            # Asset Folders: Library/Show Name/poster.jpg
-            return os.path.join(base_dir, clean_lib, folder_name, "poster.jpg")
+            return os.path.join(base_dir, clean_lib, folder_name, filename)
 
-    # SEASON
     elif item.type == 'season':
         show = item.show()
-        show_folder = get_physical_folder_name(show) # e.g. "The Office"
+        show_folder = get_physical_folder_name(show)
         season_idx = item.index
-        # Format season number: Season01, Season00
         season_str = f"Season{season_idx:02d}"
-        
         if current_style == 'NO_ASSET_FOLDERS':
-            # Flat: Library/Show Name_SeasonXX.jpg
-            return os.path.join(base_dir, clean_lib, f"{show_folder}_{season_str}.jpg")
+            suffix = "" if img_type == 'poster' else "_background"
+            return os.path.join(base_dir, clean_lib, f"{show_folder}_{season_str}{suffix}.jpg")
         else:
-            # Asset Folders (Kometa style): Library/Show Name/SeasonXX.jpg
-            # Note: DOES NOT use a Season subfolder.
-            return os.path.join(base_dir, clean_lib, show_folder, f"{season_str}.jpg")
-            
+            name = f"{season_str}.jpg" if img_type == 'poster' else f"{season_str}_background.jpg"
+            return os.path.join(base_dir, clean_lib, show_folder, name)
     return None
 
-def check_file_exists(item, lib_title=None):
-    target_path = get_target_file_path(item, lib_title)
+def check_file_exists(item, lib_title=None, img_type='poster'):
+    target_path = get_target_file_path(item, lib_title, img_type=img_type)
     if target_path:
         return os.path.exists(target_path)
     return False
-
-def get_item_status(item, lib_title):
-    """
-    Returns item status: 'complete', 'missing', or 'partial'.
-    Using accurate but slower check that loops through season objects.
-    """
-    if is_overridden(item.ratingKey):
-        return 'complete'
-    
-    if item.type == 'movie':
-        if check_file_exists(item, lib_title):
-            return 'complete'
-        return 'missing'
-    
-    if item.type == 'show':
-        has_show_poster = check_file_exists(item, lib_title)
-        
-        # Original Logic: Iterate over Season objects
-        seasons = item.seasons()
-        total_seasons = len(seasons)
-        downloaded_seasons = 0
-        
-        for season in seasons:
-            if check_file_exists(season, lib_title):
-                downloaded_seasons += 1
-        
-        all_seasons_done = (downloaded_seasons == total_seasons)
-        
-        if has_show_poster and all_seasons_done:
-            return 'complete'
-        elif not has_show_poster and downloaded_seasons == 0:
-            return 'missing'
-        else:
-            return 'partial'
-            
-    return 'missing'
 
 def get_poster_url(poster):
     key = getattr(poster, 'key', None)
@@ -309,7 +201,74 @@ def get_poster_url(poster):
     return plex.url(key)
 
 # ==========================================
-# STATS & UTILS
+# 4. HISTORY MANAGEMENT
+# ==========================================
+def load_history_data():
+    cfg = get_config()
+    hist_file = cfg.get('HISTORY_FILE', 'download_history.json')
+    if not os.path.isabs(hist_file) and DATA_DIR != '.':
+         hist_file = os.path.join(DATA_DIR, os.path.basename(hist_file))
+    if not os.path.exists(hist_file): return {"downloads": {}, "overrides": []}
+    try:
+        with open(hist_file, 'r') as f:
+            data = json.load(f)
+            if "downloads" not in data: data["downloads"] = {}
+            if "overrides" not in data: data["overrides"] = []
+            return data
+    except: return {"downloads": {}, "overrides": []}
+
+def save_history_data(data):
+    cfg = get_config()
+    hist_file = cfg.get('HISTORY_FILE', 'download_history.json')
+    if not os.path.isabs(hist_file) and DATA_DIR != '.':
+         hist_file = os.path.join(DATA_DIR, os.path.basename(hist_file))
+    with open(hist_file, 'w') as f: json.dump(data, f, indent=2)
+
+def save_download_history(rating_key, img_url, img_type='poster'):
+    data = load_history_data()
+    key = str(rating_key) if img_type == 'poster' else f"{rating_key}_bg"
+    data["downloads"][key] = img_url
+    save_history_data(data)
+
+def get_history_url(rating_key, img_type='poster'):
+    data = load_history_data()
+    key = str(rating_key) if img_type == 'poster' else f"{rating_key}_bg"
+    return data["downloads"].get(key)
+
+def toggle_override_status(rating_key):
+    data = load_history_data()
+    rk_str = str(rating_key)
+    if rk_str in data["overrides"]:
+        data["overrides"].remove(rk_str)
+        status = False
+    else:
+        data["overrides"].append(rk_str)
+        status = True
+    save_history_data(data)
+    return status
+
+def is_overridden(rating_key):
+    data = load_history_data()
+    return str(rating_key) in data["overrides"]
+
+def get_item_status(item, lib_title):
+    if is_overridden(item.ratingKey): return 'complete'
+    if item.type == 'movie':
+        return 'complete' if check_file_exists(item, lib_title) else 'missing'
+    if item.type == 'show':
+        has_show_poster = check_file_exists(item, lib_title)
+        seasons = item.seasons()
+        total = len(seasons)
+        downloaded = 0
+        for season in seasons:
+            if check_file_exists(season, lib_title): downloaded += 1
+        if has_show_poster and downloaded == total: return 'complete'
+        elif not has_show_poster and downloaded == 0: return 'missing'
+        else: return 'partial'
+    return 'missing'
+
+# ==========================================
+# 5. STATS
 # ==========================================
 def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
@@ -320,22 +279,14 @@ def format_size(size_bytes):
     return "%s %s" % (s, size_name[i])
 
 def get_library_stats(lib):
-    """
-    Calculates stats for a single library:
-    - Movies/Shows count (Plex)
-    - Episodes count (Plex - via raw query for speed)
-    - Downloaded Posters count (Local)
-    - Disk Usage (Local)
-    """
     stats = {
         'type': lib.type,
         'content_str': "0 Items",
         'downloaded_count': 0,
+        'bg_downloaded_count': 0,
         'disk_size': 0,
         'size_str': "0 B"
     }
-    
-    # 1. Plex Counts (Fast Raw Queries)
     try:
         if lib.type == 'movie':
             count = lib.totalSize
@@ -344,340 +295,228 @@ def get_library_stats(lib):
             show_count = lib.totalSize
             ep_count = 0
             try:
-                # type=4 is episode. X-Plex-Container-Size=0 requests just the count header.
                 key = f'/library/sections/{lib.key}/all?type=4&X-Plex-Container-Start=0&X-Plex-Container-Size=0'
                 container = plex.query(key)
                 ep_count = int(container.attrib.get('totalSize', 0))
-            except Exception as e:
-                print(f"Error fetching episode count: {e}")
-                pass
+            except: pass
             stats['content_str'] = f"{show_count} Shows, {ep_count} Episodes"
-    except:
-        pass
-        
-    # 2. Local File Stats
+    except: pass
+    
     cfg = get_config()
     base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
-    # Handle Docker relative path
     if not os.path.isabs(base_dir) and DATA_DIR != '.':
         base_dir = os.path.join(DATA_DIR, base_dir)
-        
+    
     clean_lib = sanitize_filename(lib.title)
     lib_dir = os.path.join(base_dir, clean_lib)
-    
-    file_count = 0
-    total_size = 0
     
     if os.path.exists(lib_dir):
         for root, dirs, files in os.walk(lib_dir):
             for f in files:
                 if f.lower().endswith('.jpg') or f.lower().endswith('.png'):
                     fp = os.path.join(root, f)
-                    file_count += 1
-                    total_size += os.path.getsize(fp)
+                    stats['disk_size'] += os.path.getsize(fp)
+                    if 'background' in f.lower(): stats['bg_downloaded_count'] += 1
+                    else: stats['downloaded_count'] += 1
     
-    stats['downloaded_count'] = file_count
-    stats['disk_size'] = total_size
-    stats['size_str'] = format_size(total_size)
-    
+    stats['size_str'] = format_size(stats['disk_size'])
     return stats
 
 # ==========================================
-# MIGRATION UTILS
+# 6. CRON SCHEDULER (Threaded)
 # ==========================================
-def perform_migration(target_style):
-    """
-    Scans the local download directory ONLY and rearranges files based on the target style.
-    Does NOT query Plex.
-    """
+def run_cron_job():
+    if not plex: return
     cfg = get_config()
-    base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
-    # Handle Docker relative path
-    if not os.path.isabs(base_dir) and DATA_DIR != '.':
-        base_dir = os.path.join(DATA_DIR, base_dir)
-        
-    if not os.path.exists(base_dir):
-        return 0, "Download directory does not exist."
-
-    moved_count = 0
-    errors = []
-
+    
+    log_verbose("Starting automated download cycle (Cron)...")
+    mode = cfg.get('CRON_MODE', 'RANDOM')
+    target_provider = cfg.get('CRON_PROVIDER', '').lower()
+    dl_bgs = cfg.get('CRON_DOWNLOAD_BACKGROUNDS', False)
+    cron_libs = cfg.get('CRON_LIBRARIES', [])
+    ignored = cfg.get('IGNORED_LIBRARIES', [])
+    
     try:
-        # Iterate over Libraries (e.g. "Movies", "TV Shows")
-        libraries = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+        libraries = plex.library.sections()
+        processed = 0
+        skipped = 0
         
-        for lib_name in libraries:
-            lib_path = os.path.join(base_dir, lib_name)
+        for lib in libraries:
+            if cron_libs and lib.title not in cron_libs: continue
+            if lib.title in ignored: continue
+            if lib.type not in ['movie', 'show']: continue
             
-            # --- STRATEGY ---
-            # 1. We iterate over all contents of the library folder.
-            # 2. We identify if items are FILES (Flat structure) or FOLDERS (Asset/Legacy structure).
-            # 3. We determine the identity (Show Name, Season Number) from the name/path.
-            # 4. We move it to the target path.
+            log_verbose(f"Cron: Processing Library '{lib.title}'...")
+            items = lib.all()
             
-            lib_contents = os.listdir(lib_path)
-            files = [f for f in lib_contents if os.path.isfile(os.path.join(lib_path, f)) and f.lower().endswith('.jpg')]
-            dirs = [d for d in lib_contents if os.path.isdir(os.path.join(lib_path, d))]
-            
-            # 1. PROCESS EXISTING FLAT FILES
-            for f in files:
-                src = os.path.join(lib_path, f)
-                filename_no_ext = os.path.splitext(f)[0]
+            for item in items:
+                tasks = [('poster', 'posters')]
+                if dl_bgs: tasks.append(('background', 'arts'))
                 
-                if target_style == 'ASSET_FOLDERS':
-                    match = re.match(r"(.*)_(Season\d+|Specials)$", filename_no_ext, re.IGNORECASE)
-                    
-                    if match:
-                        show_name = match.group(1)
-                        season_part = match.group(2) 
-                        dest_dir = os.path.join(lib_path, show_name)
-                        dest = os.path.join(dest_dir, f"{season_part}.jpg")
-                    else:
-                        dest_dir = os.path.join(lib_path, filename_no_ext)
-                        dest = os.path.join(dest_dir, "poster.jpg")
-                    
-                    try:
-                        os.makedirs(dest_dir, exist_ok=True)
-                        if not os.path.exists(dest):
-                            shutil.move(src, dest)
-                            moved_count += 1
-                    except Exception as e:
-                        errors.append(f"Error moving flat file {f}: {e}")
-
-            # 2. PROCESS EXISTING DIRECTORIES
-            for d in dirs:
-                item_dir = os.path.join(lib_path, d)
-                item_contents = os.listdir(item_dir)
-                
-                for item_file in item_contents:
-                    src = os.path.join(item_dir, item_file)
-                    
-                    if os.path.isdir(src):
+                for img_type, method in tasks:
+                    if check_file_exists(item, lib.title, img_type):
+                        skipped += 1
                         continue
-                    if not item_file.lower().endswith('.jpg'):
-                        continue
+                    
+                    try: candidates = getattr(item, method)()
+                    except: continue
+                    if not candidates: continue
+                    
+                    selected_img = None
+                    valid = [p for p in candidates if p.provider]
+                    if not valid: continue
 
-                    if target_style == 'NO_ASSET_FOLDERS':
-                        if item_file.lower() == 'poster.jpg':
-                            dest = os.path.join(lib_path, f"{d}.jpg")
-                            try:
-                                if not os.path.exists(dest):
-                                    shutil.move(src, dest)
-                                    moved_count += 1
-                            except Exception as e:
-                                errors.append(f"Error flattening poster {d}: {e}")
+                    if mode == 'RANDOM':
+                        selected_img = random.choice(valid)
+                    elif mode in ['SPECIFIC_PROVIDER', 'RANDOM_PROVIDER']:
+                        matching = [p for p in valid if target_provider in str(p.provider).lower()]
+                        if matching:
+                            if mode == 'SPECIFIC_PROVIDER': selected_img = matching[0]
+                            else: selected_img = random.choice(matching)
+                    
+                    if selected_img:
+                        try:
+                            lib_title = item.section().title
+                            save_path = get_target_file_path(item, lib_title, img_type=img_type)
+                            if save_path:
+                                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                                key = selected_img.key
+                                url = key if key.startswith('http') else plex.url(key)
                                 
-                        elif re.match(r"(Season\d+|Specials)\.jpg", item_file, re.IGNORECASE):
-                            fname_no_ext = os.path.splitext(item_file)[0]
-                            dest = os.path.join(lib_path, f"{d}_{fname_no_ext}.jpg")
-                            try:
-                                if not os.path.exists(dest):
-                                    shutil.move(src, dest)
-                                    moved_count += 1
-                            except Exception as e:
-                                errors.append(f"Error flattening season {d}: {e}")
-
-                # Check for Legacy Subfolders
-                subdirs = [sd for sd in item_contents if os.path.isdir(os.path.join(item_dir, sd))]
-                for sd in subdirs:
-                    season_str = None
-                    if sd.lower() == 'specials':
-                        season_str = 'Season00'
-                    else:
-                        match = re.match(r"Season\s*(\d+)", sd, re.IGNORECASE)
-                        if match:
-                            num = int(match.group(1))
-                            season_str = f"Season{num:02d}"
-                    
-                    if season_str:
-                        legacy_poster = os.path.join(item_dir, sd, "poster.jpg")
-                        if os.path.exists(legacy_poster):
-                            if target_style == 'ASSET_FOLDERS':
-                                dest = os.path.join(item_dir, f"{season_str}.jpg")
-                            else:
-                                dest = os.path.join(lib_path, f"{d}_{season_str}.jpg")
-                            
-                            try:
-                                if not os.path.exists(dest):
-                                    shutil.move(legacy_poster, dest)
-                                    moved_count += 1
-                                try: os.rmdir(os.path.join(item_dir, sd))
-                                except: pass
-                            except Exception as e:
-                                errors.append(f"Error migrating legacy folder {d}/{sd}: {e}")
-
-                if target_style == 'NO_ASSET_FOLDERS':
-                    try: os.rmdir(item_dir) 
-                    except: pass
-
+                                log_verbose(f"Cron: Downloading {img_type} for {item.title} (Provider: {selected_img.provider})")
+                                r = requests.get(url, stream=True)
+                                if r.status_code == 200:
+                                    with open(save_path, 'wb') as f:
+                                        for chunk in r.iter_content(1024): f.write(chunk)
+                                    save_download_history(item.ratingKey, url, img_type)
+                                    processed += 1
+                        except Exception as e:
+                            log_verbose(f"Cron Error saving {item.title}: {e}")
+        log_verbose(f"Cron Finished. Downloaded: {processed}, Skipped: {skipped}")
     except Exception as e:
-        return 0, str(e)
+        log_verbose(f"Cron Job Failed: {e}")
 
-    return moved_count, errors
+def scheduler_loop():
+    last_run_date = None
+    while True:
+        cfg = get_config()
+        if cfg.get('CRON_ENABLED'):
+            target_time = cfg.get('CRON_TIME', '03:00')
+            target_day = cfg.get('CRON_DAY', 'DAILY') # DAILY, MONDAY, etc.
+            
+            now = datetime.datetime.now()
+            current_time = now.strftime("%H:%M")
+            current_day_name = now.strftime("%A").upper()
+            current_date = now.date()
+            
+            # Check Day of Week
+            day_match = (target_day == 'DAILY') or (target_day == current_day_name)
+            
+            # Check Time + Day + Not already run today
+            if day_match and current_time == target_time and last_run_date != current_date:
+                run_cron_job()
+                last_run_date = current_date
+                time.sleep(60)
+        time.sleep(30)
+
+cron_thread = threading.Thread(target=scheduler_loop, daemon=True)
+cron_thread.start()
 
 # ==========================================
-# HTML LAYOUT PARTS
+# 7. TEMPLATES & ROUTES
 # ==========================================
+
+@app.before_request
+def require_auth():
+    log_verbose(f"Request: {request.method} {request.path} from {request.remote_addr}")
+    if request.endpoint in ['static', 'login', 'setup', 'logout', 'settings']: return
+    cfg = get_config()
+    if cfg.get('AUTH_DISABLED', False): return
+    if 'AUTH_USER' not in cfg or not cfg['AUTH_USER']: return redirect(url_for('settings'))
+    if 'user' not in session: return redirect(url_for('login'))
+    session.permanent = True
+
+@app.errorhandler(404)
+def page_not_found(e):
+    return render_template_string(HTML_TOP + """
+        <div style="text-align:center; padding: 50px;">
+            <h1>404</h1>
+            <p>Page not found. <a href="/">Go Home</a></p>
+        </div>
+    """ + HTML_BOTTOM, title="404 Not Found", breadcrumbs=[]), 404
+
+@app.context_processor
+def inject_global_vars():
+    server_name = plex.friendlyName if plex else "Disconnected"
+    cfg = get_config()
+    return dict(server_name=server_name, auth_disabled=cfg.get('AUTH_DISABLED', False), format_provider=format_provider)
 
 CSS_COMMON = """
-    :root { 
-        --bg: #121212; 
-        --nav: #232323;
-        --card: #232323; 
-        --text: #e5e5e5; 
-        --text-muted: #a0a0a0;
-        --accent: #E5A00D; 
-        --primary: #E5A00D;
-        --btn-text: #000000;
-        --warning: #cc7b19;
-        --danger: #c0392b;
-        --input-bg: #111111;
-        --border-color: #3a3a3a;
-    }
+    :root { --bg: #121212; --nav: #232323; --card: #232323; --text: #e5e5e5; --text-muted: #a0a0a0; --accent: #E5A00D; --primary: #E5A00D; --btn-text: #000000; --warning: #cc7b19; --danger: #c0392b; --input-bg: #111111; --border-color: #3a3a3a; }
     body { font-family: 'Poppins', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; font-weight: 300; }
     h1, h2, h3 { color: var(--text); font-weight: 600; }
     a { text-decoration: none; color: inherit; transition: 0.2s; }
-    
-    /* Ensure native inputs use the accent color */
     input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
-    
-    .nav { 
-        margin-bottom: 30px; padding: 15px 25px; 
-        background: var(--nav); border-radius: 12px; 
-        display: flex; justify-content: space-between; align-items: center; 
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        border-bottom: 1px solid var(--border-color);
-    }
+    .nav { margin-bottom: 30px; padding: 15px 25px; background: var(--nav); border-radius: 12px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-bottom: 1px solid var(--border-color); }
     .nav-links { display: flex; align-items: center; }
     .nav-links a { margin-right: 20px; font-weight: 600; color: var(--text); }
     .nav-links a:hover { color: var(--primary); }
-    
-    /* Search Bar */
     .search-box { position: relative; width: 300px; margin: 0 20px; }
-    .search-input { 
-        width: 100%; padding: 8px 15px; border-radius: 20px; 
-        border: 1px solid var(--border-color); background: var(--input-bg); color: var(--text); 
-        outline: none; transition: border-color 0.2s;
-    }
+    .search-input { width: 100%; padding: 8px 15px; border-radius: 20px; border: 1px solid var(--border-color); background: var(--input-bg); color: var(--text); outline: none; transition: border-color 0.2s; }
     .search-input:focus { border-color: var(--primary); }
-    .search-results {
-        position: absolute; top: 100%; left: 0; right: 0; 
-        background: var(--card); border-radius: 8px; 
-        margin-top: 5px; box-shadow: 0 10px 15px rgba(0,0,0,0.5); 
-        z-index: 100; max-height: 400px; overflow-y: auto;
-        display: none; border: 1px solid var(--border-color);
-    }
-    .search-result-item {
-        display: flex; align-items: center; padding: 10px; 
-        border-bottom: 1px solid var(--border-color); cursor: pointer; text-decoration: none; color: var(--text);
-    }
+    .search-results { position: absolute; top: 100%; left: 0; right: 0; background: var(--card); border-radius: 8px; margin-top: 5px; box-shadow: 0 10px 15px rgba(0,0,0,0.5); z-index: 100; max-height: 400px; overflow-y: auto; display: none; border: 1px solid var(--border-color); }
+    .search-result-item { display: flex; align-items: center; padding: 10px; border-bottom: 1px solid var(--border-color); cursor: pointer; text-decoration: none; color: var(--text); }
     .search-result-item:last-child { border-bottom: none; }
     .search-result-item:hover { background: #333333; }
     .search-thumb { width: 35px; height: 50px; object-fit: cover; border-radius: 4px; margin-right: 12px; background: #111; }
     .search-info { flex: 1; display: flex; flex-direction: column; }
     .search-title { font-weight: 600; font-size: 0.9em; display: block; }
     .search-meta { font-size: 0.75em; color: var(--text-muted); }
-    
-    .server-badge { 
-        background: rgba(255,255,255,0.05); color: var(--accent); 
-        padding: 6px 12px; border-radius: 6px; 
-        font-size: 0.9em; font-weight: 600; 
-        border: 1px solid var(--accent);
-    }
+    .server-badge { background: rgba(255,255,255,0.05); color: var(--accent); padding: 6px 12px; border-radius: 6px; font-size: 0.9em; font-weight: 600; border: 1px solid var(--accent); }
     .settings-link { color: var(--text-muted); font-size: 1.2em; margin-left: 15px; }
     .settings-link:hover { color: var(--text); transform: rotate(90deg); }
-    
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 25px; }
-    
-    /* Separate Grid for Home Page to allow growth */
-    .home-grid { 
-        display: flex; 
-        flex-wrap: wrap; 
-        justify-content: center; 
-        gap: 25px; 
-    }
-    
-    .card { 
-        background: var(--card); border-radius: 12px; overflow: hidden; 
-        transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s; position: relative; 
-        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
-        border: 2px solid transparent;
-        /* Flex properties for Home Cards */
-        flex: 1 1 300px; /* Grow, Shrink, Basis */
-        max-width: 400px;
-        min-width: 250px;
-    }
-    .card:hover { 
-        transform: translateY(-5px); 
-        cursor: pointer; 
-        box-shadow: 0 10px 15px rgba(0,0,0,0.4); 
-        border-color: var(--accent);
-    }
+    .home-grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 25px; }
+    .card { background: var(--card); border-radius: 12px; overflow: hidden; transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s; position: relative; box-shadow: 0 4px 6px rgba(0,0,0,0.2); border: 2px solid transparent; flex: 1 1 300px; max-width: 400px; min-width: 250px; }
+    .card:hover { transform: translateY(-5px); cursor: pointer; box-shadow: 0 10px 15px rgba(0,0,0,0.4); border-color: var(--accent); }
     .card img { width: 100%; height: 300px; object-fit: cover; background: #000; }
     .card .title { padding: 15px; text-align: center; font-size: 1.1em; font-weight: 600; color: var(--text); line-height: 1.4; transition: color 0.2s; }
     .card:hover .title { color: var(--accent); }
-    
-    /* Homepage Card Special Styling */
-    .home-card {
-        flex: 1 1 300px;
-        min-width: 250px;
-        /* No max-width allows it to grow infinitely */
-    }
     .home-card:hover { border: 2px solid var(--accent); }
     .home-card:hover .title { color: var(--accent) !important; }
-    
     .poster-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 25px; }
-    .poster-card { 
-        background: var(--card); padding: 10px; border-radius: 12px; 
-        text-align: center; position: relative; border: 4px solid transparent; 
-        transition: 0.2s;
-    }
+    .background-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 25px; }
+    .poster-card { background: var(--card); padding: 10px; border-radius: 12px; text-align: center; position: relative; border: 4px solid transparent; transition: 0.2s; }
+    .img-container { position: relative; overflow: hidden; border-radius: 8px; }
     .poster-card img { width: 100%; border-radius: 8px; }
     .poster-card:hover { background: #333333; border-color: var(--accent); }
     .poster-card.selected { border-color: var(--accent); background: rgba(229, 160, 13, 0.1); }
-    .selected-badge { 
-        position: absolute; top: -10px; right: -10px; 
-        background: var(--accent); color: var(--btn-text); 
-        padding: 5px 12px; border-radius: 20px; 
-        font-weight: 800; font-size: 0.8em; 
-        box-shadow: 0 4px 6px rgba(0,0,0,0.5); 
-    }
-    
-    .btn { 
-        display: block; width: 100%; background: var(--primary); color: var(--btn-text); 
-        padding: 12px 0; border: none; cursor: pointer; margin-top: 12px; 
-        font-weight: 600; border-radius: 8px; font-family: inherit;
-    }
+    .background-card { background: var(--card); padding: 10px; border-radius: 12px; text-align: center; position: relative; border: 4px solid transparent; transition: 0.2s; }
+    .background-card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; border-radius: 8px; }
+    .background-card:hover { background: #333333; border-color: var(--accent); }
+    .background-card.selected { border-color: var(--accent); background: rgba(229, 160, 13, 0.1); }
+    .selected-badge { position: absolute; top: 8px; right: 8px; background: var(--accent); color: var(--btn-text); padding: 5px 12px; border-radius: 20px; font-weight: 800; font-size: 0.8em; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
+    .provider-badge { position: absolute; top: 8px; left: 8px; background: rgba(0, 0, 0, 0.8); color: rgba(255, 255, 255, 0.8); padding: 3px 6px; border-radius: 4px; font-size: 0.75em; backdrop-filter: blur(2px); border: 1px solid rgba(255,255,255,0.1); pointer-events: none; }
+    .btn { display: block; width: 100%; background: var(--primary); color: var(--btn-text); padding: 12px 0; border: none; cursor: pointer; margin-top: 12px; font-weight: 600; border-radius: 8px; font-family: inherit; }
     .btn:hover { filter: brightness(1.1); }
     .btn-danger { background: var(--danger); color: white; }
     .btn-danger:hover { background: #c0392b; }
     .btn-toggle { background: #3a3a3a; color: white; width: auto; display: inline-block; padding: 10px 20px; margin-left: 20px; }
     .btn-toggle.active { background: var(--accent); color: var(--btn-text); }
-    
     .pagination { text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border-color); }
-    .page-btn { 
-        background: var(--card); color: var(--text); padding: 10px 20px; 
-        text-decoration: none; border-radius: 6px; margin: 0 5px; display: inline-block;
-    }
+    .page-btn { background: var(--card); color: var(--text); padding: 10px 20px; text-decoration: none; border-radius: 6px; margin: 0 5px; display: inline-block; }
     .page-btn:hover { background: var(--primary); color: var(--btn-text); }
     .page-info { color: var(--text-muted); margin: 0 15px; }
-    
     .form-group { margin-bottom: 20px; }
     .form-group label { display: block; margin-bottom: 8px; font-weight: 600; color: var(--text-muted); }
-    .form-group input, .form-group select { 
-        width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); 
-        background: var(--input-bg); color: white; font-family: inherit; box-sizing: border-box;
-    }
+    .form-group input, .form-group select { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--input-bg); color: white; font-family: inherit; box-sizing: border-box; }
     .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--primary); }
     .form-group input:disabled { background: #0a0a0a; color: #555; border-color: #222; cursor: not-allowed; }
-    
     .flash { background: rgba(229, 160, 13, 0.2); color: var(--accent); padding: 15px; margin-bottom: 25px; border-radius: 8px; border: 1px solid var(--accent); }
     .path-info { font-size: 0.85em; color: var(--text-muted); margin-bottom: 15px; font-family: monospace; background: rgba(0,0,0,0.3); padding: 5px 10px; border-radius: 4px; display: inline-block; }
     .section-header { margin-top: 50px; border-bottom: 2px solid var(--nav); padding-bottom: 10px; margin-bottom: 25px; display: flex; align-items: center; justify-content: space-between; }
     .section-header h2 { margin: 0; font-size: 1.4em; }
     .section-header span { font-size: 0.9em; color: var(--text-muted); background: var(--nav); padding: 4px 10px; border-radius: 20px; }
-    
-    /* Stats Table */
     .stats-container { margin-top: 60px; border-top: 1px solid var(--border-color); padding-top: 30px; }
     .stats-table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.2); }
     .stats-table th, .stats-table td { padding: 15px; text-align: left; border-bottom: 1px solid var(--border-color); }
@@ -685,6 +524,12 @@ CSS_COMMON = """
     .stats-table tr:last-child td { border-bottom: none; }
     .stats-table tr:hover { background: rgba(255,255,255,0.02); }
     .stat-number { font-family: monospace; color: var(--accent); font-weight: bold; }
+    .tabs { display: flex; border-bottom: 1px solid var(--border-color); margin-bottom: 20px; }
+    .tab-btn { background: transparent; border: none; padding: 15px 25px; font-size: 1.1em; font-weight: 600; color: var(--text-muted); cursor: pointer; border-bottom: 3px solid transparent; }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-btn:hover { color: var(--text); }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
 """
 
 HTML_TOP = """
@@ -701,17 +546,10 @@ HTML_TOP = """
     </style>
     <script>
     let searchTimeout;
-    
     function handleSearch(query) {
         clearTimeout(searchTimeout);
         const resultsDiv = document.getElementById('search-results');
-        
-        if (query.length < 2) {
-            resultsDiv.style.display = 'none';
-            resultsDiv.innerHTML = '';
-            return;
-        }
-        
+        if (query.length < 2) { resultsDiv.style.display = 'none'; resultsDiv.innerHTML = ''; return; }
         searchTimeout = setTimeout(() => {
             fetch(`/api/search?q=${encodeURIComponent(query)}`)
                 .then(response => response.json())
@@ -723,10 +561,8 @@ HTML_TOP = """
                             const div = document.createElement('a');
                             div.href = `/item/${item.ratingKey}`;
                             div.className = 'search-result-item';
-                            
                             const year = item.year ? `(${item.year})` : '';
                             const type = item.type === 'show' ? '📺' : '🎬';
-                            
                             div.innerHTML = `
                                 <img src="${item.thumb}" class="search-thumb" onerror="this.src='https://via.placeholder.com/40x60?text=?'">
                                 <div class="search-info">
@@ -739,25 +575,20 @@ HTML_TOP = """
                             `;
                             resultsDiv.appendChild(div);
                         });
-                    } else {
-                        resultsDiv.style.display = 'none';
-                    }
-                })
-                .catch(err => console.error(err));
+                    } else { resultsDiv.style.display = 'none'; }
+                }).catch(err => console.error(err));
         }, 300);
     }
-    
-    function hideSearch() {
-        const resultsDiv = document.getElementById('search-results');
-        // Small delay to allow click events on links to register
-        setTimeout(() => {
-            resultsDiv.style.display = 'none';
-        }, 200);
+    function hideSearch() { setTimeout(() => { document.getElementById('search-results').style.display = 'none'; }, 200); }
+    function switchTab(tabId) {
+        document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        document.getElementById(tabId).style.display = 'block';
+        document.querySelector(`button[onclick="switchTab('${tabId}')"]`).classList.add('active');
     }
     </script>
 </head>
 <body>
-
     <div class="nav">
         <div class="nav-links">
             <a href="/">Home</a>
@@ -767,35 +598,25 @@ HTML_TOP = """
                 {% endfor %}
             {% endif %}
         </div>
-        
         {% if request.endpoint not in ['login', 'settings', 'setup'] %}
         <div class="search-box">
             <input type="text" class="search-input" placeholder="Search movies & shows..." oninput="handleSearch(this.value)" onblur="hideSearch()">
             <div id="search-results" class="search-results"></div>
         </div>
         {% endif %}
-        
         <div style="display:flex; align-items:center;">
-            <div class="server-badge">
-                Plex Server: {{ server_name }}
-            </div>
+            <div class="server-badge">Plex Server: {{ server_name }}</div>
             <a href="/settings" class="settings-link" title="Settings">⚙️</a>
-            {% if auth_disabled %}
-                <a href="/settings" class="settings-link" title="Login / Enable Auth" style="font-size:0.9em; margin-left: 20px;">Login</a>
-            {% else %}
+            {% if not auth_disabled %}
                 <a href="/logout" class="settings-link" title="Logout" style="font-size:0.9em; margin-left: 20px;">Logout</a>
             {% endif %}
         </div>
     </div>
-
     {% with messages = get_flashed_messages() %}
         {% if messages %}
-            {% for message in messages %}
-                <div class="flash">{{ message }}</div>
-            {% endfor %}
+            {% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}
         {% endif %}
     {% endwith %}
-
     <div style="display:flex; justify-content:space-between; align-items:center;">
         <h1>{{ title }}</h1>
         {% if toggle_override %}
@@ -807,465 +628,16 @@ HTML_TOP = """
         </form>
         {% endif %}
     </div>
-    <!-- PAGE CONTENT STARTS HERE -->
 """
 
-HTML_BOTTOM = """
-    <!-- PAGE CONTENT ENDS HERE -->
-</body>
-</html>
-"""
-
-HTML_LOGIN_SETUP = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - Poster Manager</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>">
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet">
-    <style>
-        """ + CSS_COMMON + """
-        body { display: flex; align-items: center; justify-content: center; height: 100vh; padding: 0; }
-        .auth-container { width: 100%; max-width: 400px; }
-        .card { padding: 40px; transform: none !important; cursor: default !important; }
-        .card:hover { transform: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-    </style>
-</head>
-<body>
-    <div class="auth-container">
-        <div class="card">
-            <div style="text-align: center; margin-bottom: 30px;">
-                <div style="font-size: 3em;">🎬</div>
-                <h2>{{ title }}</h2>
-                <p style="color: var(--text-muted);">{{ subtitle }}</p>
-            </div>
-            
-            {% with messages = get_flashed_messages() %}
-                {% if messages %}
-                    {% for message in messages %}
-                        <div class="flash" style="text-align:center;">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-            
-            <form method="post">
-                <div class="form-group">
-                    <label>Username</label>
-                    <input type="text" name="username" required autofocus>
-                </div>
-                <div class="form-group">
-                    <label>Password</label>
-                    <input type="password" name="password" required>
-                </div>
-                {% if is_setup %}
-                <div class="form-group">
-                    <label>Confirm Password</label>
-                    <input type="password" name="confirm_password" required>
-                </div>
-                {% endif %}
-                <button type="submit" class="btn">{{ btn_text }}</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-# ==========================================
-# ROUTES
-# ==========================================
-
-@app.route('/api/search')
-def api_search():
-    if not plex: return jsonify([])
-    query = request.args.get('q', '')
-    if len(query) < 2: return jsonify([])
-    
-    try:
-        # Search widely (fetch a bit more to allow for filtering)
-        results = plex.search(query, limit=20)
-        
-        data = []
-        for item in results:
-            # Filter for Movies and Shows only
-            if item.type not in ['movie', 'show']:
-                continue
-                
-            thumb = item.thumbUrl if item.thumb else ''
-            year = getattr(item, 'year', '')
-            
-            data.append({
-                'title': item.title,
-                'year': year,
-                'ratingKey': item.ratingKey,
-                'thumb': thumb,
-                'type': item.type
-            })
-            
-            # Limit the dropdown response to 10 items
-            if len(data) >= 10:
-                break
-                
-        return jsonify(data)
-    except Exception as e:
-        print(f"Search Error: {e}")
-        return jsonify([])
-
-@app.route('/setup', methods=['GET', 'POST'])
-def setup():
-    cfg = get_config()
-    if 'AUTH_USER' in cfg and cfg['AUTH_USER']:
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        confirm = request.form['confirm_password']
-        
-        if password != confirm:
-            flash("Passwords do not match.")
-        elif len(password) < 4:
-            flash("Password must be at least 4 characters.")
-        else:
-            cfg['AUTH_USER'] = username
-            cfg['AUTH_HASH'] = generate_password_hash(password)
-            cfg['AUTH_DISABLED'] = False
-            save_config(cfg)
-            flash("Account created! Please login.")
-            return redirect(url_for('login'))
-
-    return render_template_string(HTML_LOGIN_SETUP, 
-                                  title="Setup Admin", 
-                                  subtitle="Create your admin account to secure access.",
-                                  btn_text="Create Account",
-                                  is_setup=True)
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    cfg = get_config()
-    if cfg.get('AUTH_DISABLED', False):
-        return redirect(url_for('home'))
-
-    if 'user' in session:
-        return redirect(url_for('home'))
-
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        
-        stored_user = cfg.get('AUTH_USER')
-        stored_hash = cfg.get('AUTH_HASH')
-        
-        if username == stored_user and check_password_hash(stored_hash, password):
-            session.permanent = True
-            session['user'] = username
-            return redirect(url_for('home'))
-        else:
-            flash("Invalid username or password.")
-
-    return render_template_string(HTML_LOGIN_SETUP, 
-                                  title="Login", 
-                                  subtitle="Please sign in to continue.",
-                                  btn_text="Sign In",
-                                  is_setup=False)
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
-@app.route('/settings', methods=['GET', 'POST'])
-def settings():
-    cfg = get_config()
-    
-    # Check if this is "first run" / unconfigured
-    is_unconfigured = 'AUTH_USER' not in cfg or not cfg['AUTH_USER']
-    auth_disabled = cfg.get('AUTH_DISABLED', False)
-    
-    # Fetch all libraries for the checkbox list
-    all_libs = []
-    if plex:
-        try:
-            all_libs = plex.library.sections()
-        except:
-            pass
-    
-    if request.method == 'POST':
-        action = request.form.get('action')
-        
-        if action == 'update_config':
-            # Merge new config with existing to preserve Auth fields
-            cfg['PLEX_URL'] = request.form.get('plex_url', '').strip()
-            cfg['PLEX_TOKEN'] = request.form.get('plex_token', '').strip()
-            cfg['DOWNLOAD_BASE_DIR'] = request.form.get('download_dir', 'downloaded_posters').strip()
-            cfg['HISTORY_FILE'] = request.form.get('history_file', 'download_history.json').strip()
-            cfg['ASSET_STYLE'] = request.form.get('asset_style', 'ASSET_FOLDERS')
-            
-            # Update Ignored Libraries from Checkboxes
-            # getlist returns a list of values from checked boxes
-            ignored = request.form.getlist('ignored_libs')
-            cfg['IGNORED_LIBRARIES'] = ignored
-            
-            save_config(cfg)
-            
-            # Try to reconnect
-            if init_plex():
-                flash("Settings saved and connected to Plex successfully!")
-                return redirect(url_for('home'))
-            else:
-                flash("Settings saved, but could not connect to Plex. Check URL and Token.")
-        
-        elif action == 'migrate_assets':
-            # Perform Migration
-            target_style = request.form.get('target_style')
-            count, error = perform_migration(target_style)
-            if error and isinstance(error, list) and len(error) > 0:
-                flash(f"Migrated {count} files. Errors: {len(error)} files failed.")
-                print(error) # Log errors to console
-            elif error:
-                flash(f"Migration Failed: {error}")
-            else:
-                flash(f"Successfully migrated {count} files to {target_style} structure.")
-            
-            # Update config to match migration
-            cfg['ASSET_STYLE'] = target_style
-            save_config(cfg)
-            
-        elif action == 'change_password':
-            current_pw = request.form.get('current_password')
-            new_pw = request.form.get('new_password')
-            confirm_pw = request.form.get('confirm_password')
-            
-            stored_hash = cfg.get('AUTH_HASH')
-            if not stored_hash or not check_password_hash(stored_hash, current_pw):
-                flash("Current password incorrect.")
-            elif new_pw != confirm_pw:
-                flash("New passwords do not match.")
-            elif len(new_pw) < 4:
-                flash("New password must be at least 4 characters.")
-            else:
-                cfg['AUTH_HASH'] = generate_password_hash(new_pw)
-                save_config(cfg)
-                flash("Password updated successfully.")
-        
-        elif action == 'create_account':
-            username = request.form.get('new_username')
-            new_pw = request.form.get('new_password')
-            confirm_pw = request.form.get('confirm_password')
-            
-            if new_pw != confirm_pw:
-                flash("Passwords do not match.")
-            elif len(new_pw) < 4:
-                flash("Password must be at least 4 characters.")
-            else:
-                cfg['AUTH_USER'] = username
-                cfg['AUTH_HASH'] = generate_password_hash(new_pw)
-                cfg['AUTH_DISABLED'] = False
-                save_config(cfg)
-                
-                # Auto login after creation
-                session.permanent = True
-                session['user'] = username
-                flash("Account created successfully!")
-                return redirect(url_for('home'))
-                
-        elif action == 'disable_auth':
-            # If unconfigured, no password needed to disable
-            if is_unconfigured:
-                cfg['AUTH_DISABLED'] = True
-                save_config(cfg)
-                flash("Authentication disabled.")
-                return redirect(url_for('home'))
-            else:
-                # If configured, require password
-                current_pw = request.form.get('current_password_disable')
-                stored_hash = cfg.get('AUTH_HASH')
-                if not stored_hash or not check_password_hash(stored_hash, current_pw):
-                    flash("Incorrect password. Cannot disable authentication.")
-                else:
-                    cfg['AUTH_DISABLED'] = True
-                    cfg.pop('AUTH_USER', None)
-                    cfg.pop('AUTH_HASH', None)
-                    save_config(cfg)
-                    session.clear()
-                    flash("Authentication completely disabled.")
-                    return redirect(url_for('home'))
-            
-        return redirect(url_for('settings'))
-
-    content = """
-    <div style="max-width: 800px; margin: 0 auto;">
-        
-        <!-- PLEX CONFIGURATION -->
-        <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none; margin-bottom: 30px;">
-            <h2 style="margin-top:0;">Configuration</h2>
-            <form method="post">
-                <input type="hidden" name="action" value="update_config">
-                <div class="form-group">
-                    <label>Plex Server URL</label>
-                    <input type="text" name="plex_url" value="{{ cfg.PLEX_URL }}" placeholder="http://localhost:32400">
-                </div>
-                <div class="form-group">
-                    <label>Plex Token (X-Plex-Token)</label>
-                    <input type="text" name="plex_token" value="{{ cfg.PLEX_TOKEN }}" placeholder="Your Plex Token">
-                </div>
-                <div class="form-group">
-                    <label>Download Directory</label>
-                    <input type="text" name="download_dir" value="{{ cfg.DOWNLOAD_BASE_DIR }}">
-                </div>
-                <div class="form-group">
-                    <label>Asset Folder Style</label>
-                    <select name="asset_style">
-                        <option value="ASSET_FOLDERS" {% if cfg.ASSET_STYLE == 'ASSET_FOLDERS' %}selected{% endif %}>Asset Folders (Kometa Default)</option>
-                        <option value="NO_ASSET_FOLDERS" {% if cfg.ASSET_STYLE == 'NO_ASSET_FOLDERS' %}selected{% endif %}>No Asset Folders (Flat)</option>
-                    </select>
-                    <small style="color:var(--text-muted); display:block; margin-top:5px;">
-                        <strong>Asset Folders:</strong> Movies/Show Name/poster.jpg<br>
-                        <strong>No Asset Folders:</strong> Movies/Movie Name.jpg
-                    </small>
-                </div>
-                <div class="form-group">
-                    <label>History File Name</label>
-                    <input type="text" name="history_file" value="{{ cfg.HISTORY_FILE }}">
-                </div>
-                
-                <div class="form-group">
-                    <label>Manage Hidden Libraries</label>
-                    {% if all_libs %}
-                        <div style="max-height: 200px; overflow-y: auto; background: #141719; border: 1px solid #4b5563; border-radius: 8px; padding: 10px;">
-                            {% for lib in all_libs %}
-                            <div style="display:flex; align-items:center; margin-bottom:8px;">
-                                <input type="checkbox" name="ignored_libs" value="{{ lib.title }}" id="lib_{{ loop.index }}" 
-                                    {% if lib.title in cfg.IGNORED_LIBRARIES %}checked{% endif %} 
-                                    style="width:auto; margin-right:10px;">
-                                <label for="lib_{{ loop.index }}" style="margin:0; font-weight:400; color:var(--text); cursor:pointer;">{{ lib.title }}</label>
-                            </div>
-                            {% endfor %}
-                        </div>
-                        <small style="color:var(--text-muted);">Checked libraries will be HIDDEN from the home page.</small>
-                    {% else %}
-                        <p style="color:var(--warning); font-size:0.9em; background:rgba(245, 158, 11, 0.1); padding:10px; border-radius:6px; border:1px solid var(--warning);">
-                            ⚠️ Connect to Plex to load library list.
-                        </p>
-                    {% endif %}
-                </div>
-                
-                <button type="submit" class="btn">Save & Connect</button>
-            </form>
-        </div>
-        
-        <!-- MIGRATION TOOLS -->
-        <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none; margin-bottom: 30px;">
-            <h2 style="margin-top:0;">File Structure Migration</h2>
-            <p style="color:var(--text-muted);">Convert existing downloaded posters to a new folder structure. This scans all items in your Plex libraries and moves local files if found.</p>
-            
-            <form method="post" onsubmit="return confirm('This will move/rename files in your download directory. This might take a while. Continue?');">
-                <input type="hidden" name="action" value="migrate_assets">
-                <div class="form-group">
-                    <label>Convert To:</label>
-                    <select name="target_style">
-                        <option value="ASSET_FOLDERS">Asset Folders (Folders per item)</option>
-                        <option value="NO_ASSET_FOLDERS">No Asset Folders (Flat in Library)</option>
-                    </select>
-                </div>
-                <button type="submit" class="btn">Migrate Files</button>
-            </form>
-        </div>
-        
-        <!-- ACCOUNT SECURITY -->
-        <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none;">
-            <h2 style="margin-top:0; color: #fff;">Account Security</h2>
-            
-            {% if is_unconfigured or auth_disabled %}
-                <!-- UNCONFIGURED / DISABLED STATE -->
-                {% if auth_disabled %}
-                    <div style="background: rgba(229, 160, 13, 0.1); padding: 15px; border-radius: 8px; border: 1px solid var(--accent); margin-bottom: 20px;">
-                        <strong style="color: var(--accent);">Authentication is currently disabled.</strong>
-                        <p style="margin: 5px 0 0 0; font-size: 0.9em; color: var(--text-muted);">Use the form below to re-enable authentication by creating an account.</p>
-                    </div>
-                {% else %}
-                    <p style="color:var(--text-muted); margin-bottom:20px;">Authentication is not set up. Please create an admin account or disable authentication.</p>
-                {% endif %}
-
-                <form method="post" style="margin-bottom: 30px;">
-                    <input type="hidden" name="action" value="create_account">
-                    <h3 style="font-size: 1.1em; color: var(--text);">Setup Admin Account</h3>
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" name="new_username" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" name="new_password" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Confirm Password</label>
-                        <input type="password" name="confirm_password" required>
-                    </div>
-                    <button type="submit" class="btn">Create Account & Enable Auth</button>
-                </form>
-                
-                {% if not auth_disabled %}
-                <div style="border-top: 1px solid #4b5563; padding-top: 20px;">
-                    <form method="post" onsubmit="return confirm('Are you sure? Anyone will be able to access this site.');">
-                        <input type="hidden" name="action" value="disable_auth">
-                        <button type="submit" class="btn btn-danger">Disable Authentication</button>
-                    </form>
-                </div>
-                {% endif %}
-                
-            {% else %}
-                <!-- CONFIGURED STATE -->
-                <div style="margin-bottom: 30px;">
-                    <form method="post">
-                        <input type="hidden" name="action" value="change_password">
-                        <div class="form-group">
-                            <label>Username</label>
-                            <input type="text" value="{{ cfg.AUTH_USER }}" disabled>
-                        </div>
-                        <div class="form-group">
-                            <label>Current Password</label>
-                            <input type="password" name="current_password" required>
-                        </div>
-                        <div class="form-group">
-                            <label>New Password</label>
-                            <input type="password" name="new_password" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Confirm New Password</label>
-                            <input type="password" name="confirm_password" required>
-                        </div>
-                        <button type="submit" class="btn">Update Password</button>
-                    </form>
-                </div>
-                
-                <div style="border-top: 1px solid #4b5563; padding-top: 20px;">
-                    <h3 style="color: var(--danger); font-size: 1.1em; margin-top: 0;">Danger Zone</h3>
-                    <p style="font-size: 0.9em; color: var(--text-muted); margin-bottom: 15px;">Disabling authentication allows anyone to access this interface without logging in.</p>
-                    <form method="post" onsubmit="return confirm('Are you sure you want to disable authentication? Anyone will be able to access this site.');">
-                        <input type="hidden" name="action" value="disable_auth">
-                        <div class="form-group">
-                            <label>Enter Password to Disable Auth</label>
-                            <input type="password" name="current_password_disable" required>
-                        </div>
-                        <button type="submit" class="btn btn-danger">Disable Authentication</button>
-                    </form>
-                </div>
-            {% endif %}
-        </div>
-        
-    </div>
-    """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=cfg, all_libs=all_libs, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
+HTML_BOTTOM = "</body></html>"
+HTML_LOGIN_SETUP = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{{ title }} - Poster Manager</title><link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>"><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet"><style>""" + CSS_COMMON + """body{display:flex;align-items:center;justify-content:center;height:100vh;padding:0}.auth-container{width:100%;max-width:400px}.card{padding:40px;transform:none!important;cursor:default!important}.card:hover{transform:none;box-shadow:0 4px 6px rgba(0,0,0,0.1)}</style></head><body><div class="auth-container"><div class="card"><div style="text-align:center;margin-bottom:30px"><div style="font-size:3em">🎬</div><h2>{{ title }}</h2><p style="color:var(--text-muted)">{{ subtitle }}</p></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for message in messages %}<div class="flash" style="text-align:center">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post"><div class="form-group"><label>Username</label><input type="text" name="username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" name="password" required></div>{% if is_setup %}<div class="form-group"><label>Confirm Password</label><input type="password" name="confirm_password" required></div>{% endif %}<button type="submit" class="btn">{{ btn_text }}</button></form></div></div></body></html>"""
 
 @app.route('/')
 def home():
     if not plex:
         flash("Please configure your Plex Server connection.")
         return redirect(url_for('settings'))
-        
     try:
         libs = plex.library.sections()
     except:
@@ -1274,18 +646,16 @@ def home():
 
     cfg = get_config()
     ignored = cfg.get('IGNORED_LIBRARIES', [])
-    
-    # Filter ignored libs
     visible_libs = [lib for lib in libs if lib.title not in ignored]
     
-    # Calculate stats for each visible library
     lib_stats = []
     for lib in visible_libs:
         stats = get_library_stats(lib)
         lib_stats.append({
             'title': lib.title,
-            'content': stats['content_str'], # Unified content string
-            'downloaded': stats['downloaded_count'],
+            'content': stats['content_str'],
+            'posters': stats['downloaded_count'],
+            'backgrounds': stats['bg_downloaded_count'],
             'size': stats['size_str']
         })
 
@@ -1300,26 +670,17 @@ def home():
             </a>
         {% endfor %}
     </div>
-    
     <div class="stats-container">
-        <div class="section-header" style="margin-top:0;">
-            <h2>Library Statistics</h2>
-        </div>
+        <div class="section-header" style="margin-top:0;"><h2>Library Statistics</h2></div>
         <table class="stats-table">
-            <thead>
-                <tr>
-                    <th>Library</th>
-                    <th>Content</th>
-                    <th>Posters Downloaded</th>
-                    <th>Disk Usage</th>
-                </tr>
-            </thead>
+            <thead><tr><th>Library</th><th>Content</th><th>Posters</th><th>Backgrounds</th><th>Disk Usage</th></tr></thead>
             <tbody>
                 {% for stat in lib_stats %}
                 <tr>
                     <td style="font-weight:600; color:var(--text);">{{ stat.title }}</td>
                     <td class="stat-number">{{ stat.content }}</td>
-                    <td class="stat-number" style="color:var(--accent);">{{ stat.downloaded }}</td>
+                    <td class="stat-number" style="color:var(--accent);">{{ stat.posters }}</td>
+                    <td class="stat-number" style="color:var(--text-muted);">{{ stat.backgrounds }}</td>
                     <td class="stat-number" style="color:var(--text-muted);">{{ stat.size }}</td>
                 </tr>
                 {% endfor %}
@@ -1329,73 +690,394 @@ def home():
     """
     return render_template_string(HTML_TOP + content + HTML_BOTTOM, visible_libs=visible_libs, lib_stats=lib_stats, title="Select a Library", breadcrumbs=[], toggle_override=False)
 
-# ... existing routes ...
+@app.route('/api/search')
+def api_search():
+    if not plex: return jsonify([])
+    query = request.args.get('q', '')
+    if len(query) < 2: return jsonify([])
+    try:
+        results = plex.search(query, limit=20)
+        data = []
+        for item in results:
+            if item.type not in ['movie', 'show']: continue
+            thumb = item.thumbUrl if item.thumb else ''
+            year = getattr(item, 'year', '')
+            data.append({
+                'title': item.title,
+                'year': year,
+                'ratingKey': item.ratingKey,
+                'thumb': thumb,
+                'type': item.type
+            })
+            if len(data) >= 10: break
+        return jsonify(data)
+    except: return jsonify([])
+
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    cfg = get_config()
+    if 'AUTH_USER' in cfg and cfg['AUTH_USER']: return redirect(url_for('login'))
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        confirm = request.form['confirm_password']
+        if password != confirm: flash("Passwords do not match.")
+        elif len(password) < 4: flash("Password must be at least 4 characters.")
+        else:
+            cfg['AUTH_USER'] = username
+            cfg['AUTH_HASH'] = generate_password_hash(password)
+            cfg['AUTH_DISABLED'] = False
+            save_config(cfg)
+            flash("Account created! Please login.")
+            return redirect(url_for('login'))
+    return render_template_string(HTML_LOGIN_SETUP, title="Setup Admin", subtitle="Create your admin account to secure access.", btn_text="Create Account", is_setup=True)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    cfg = get_config()
+    if cfg.get('AUTH_DISABLED', False): return redirect(url_for('home'))
+    if 'user' in session: return redirect(url_for('home'))
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        stored_user = cfg.get('AUTH_USER')
+        stored_hash = cfg.get('AUTH_HASH')
+        if username == stored_user and check_password_hash(stored_hash, password):
+            session.permanent = True
+            session['user'] = username
+            return redirect(url_for('home'))
+        else: flash("Invalid username or password.")
+    return render_template_string(HTML_LOGIN_SETUP, title="Login", subtitle="Please sign in to continue.", btn_text="Sign In", is_setup=False)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    cfg = get_config()
+    is_unconfigured = 'AUTH_USER' not in cfg or not cfg['AUTH_USER']
+    auth_disabled = cfg.get('AUTH_DISABLED', False)
+    all_libs = []
+    if plex:
+        try: all_libs = plex.library.sections()
+        except: pass
+    
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'update_config':
+            cfg['PLEX_URL'] = request.form.get('plex_url', '').strip()
+            cfg['PLEX_TOKEN'] = request.form.get('plex_token', '').strip()
+            cfg['DOWNLOAD_BASE_DIR'] = request.form.get('download_dir', 'downloaded_posters').strip()
+            cfg['HISTORY_FILE'] = request.form.get('history_file', 'download_history.json').strip()
+            cfg['ASSET_STYLE'] = request.form.get('asset_style', 'ASSET_FOLDERS')
+            cfg['CRON_ENABLED'] = (request.form.get('cron_enabled') == 'on')
+            
+            # Time Handling
+            day = request.form.get('cron_day', 'DAILY')
+            # 12h to 24h Conversion
+            h_12 = int(request.form.get('cron_hour', '12'))
+            m = int(request.form.get('cron_minute', '00'))
+            ampm = request.form.get('cron_ampm', 'AM')
+            
+            h_24 = h_12
+            if ampm == 'PM' and h_12 != 12:
+                h_24 += 12
+            elif ampm == 'AM' and h_12 == 12:
+                h_24 = 0
+            
+            cfg['CRON_DAY'] = day
+            cfg['CRON_TIME'] = f"{h_24:02d}:{m:02d}"
+
+            cfg['CRON_MODE'] = request.form.get('cron_mode', 'RANDOM')
+            cfg['CRON_PROVIDER'] = request.form.get('cron_provider', '').strip()
+            cfg['CRON_DOWNLOAD_BACKGROUNDS'] = (request.form.get('cron_download_backgrounds') == 'on')
+            cfg['VERBOSE_LOGGING'] = (request.form.get('cron_logging') == 'on')
+            cfg['IGNORED_LIBRARIES'] = request.form.getlist('ignored_libs')
+            cfg['CRON_LIBRARIES'] = request.form.getlist('cron_libs')
+            save_config(cfg)
+            if init_plex(): flash("Settings saved and connected!")
+            else: flash("Settings saved but connection failed.")
+            return redirect(url_for('home'))
+        elif action == 'migrate_assets':
+            target_style = request.form.get('target_style')
+            count, error = perform_migration(target_style)
+            if error: flash(f"Migration error: {error}")
+            else: flash(f"Migrated {count} files.")
+            cfg['ASSET_STYLE'] = target_style
+            save_config(cfg)
+        elif action == 'change_password':
+            current_pw = request.form.get('current_password')
+            new_pw = request.form.get('new_password')
+            confirm_pw = request.form.get('confirm_password')
+            stored_hash = cfg.get('AUTH_HASH')
+            if not stored_hash or not check_password_hash(stored_hash, current_pw): flash("Current password incorrect.")
+            elif new_pw != confirm_pw: flash("New passwords do not match.")
+            elif len(new_pw) < 4: flash("Password too short.")
+            else:
+                cfg['AUTH_HASH'] = generate_password_hash(new_pw)
+                save_config(cfg)
+                flash("Password updated.")
+        elif action == 'create_account':
+            username = request.form.get('new_username')
+            new_pw = request.form.get('new_password')
+            confirm_pw = request.form.get('confirm_password')
+            if new_pw != confirm_pw: flash("Passwords do not match.")
+            elif len(new_pw) < 4: flash("Password too short.")
+            else:
+                cfg['AUTH_USER'] = username
+                cfg['AUTH_HASH'] = generate_password_hash(new_pw)
+                cfg['AUTH_DISABLED'] = False
+                save_config(cfg)
+                session.permanent = True
+                session['user'] = username
+                flash("Account created!")
+                return redirect(url_for('home'))
+        elif action == 'disable_auth':
+            if is_unconfigured:
+                cfg['AUTH_DISABLED'] = True
+                save_config(cfg)
+                return redirect(url_for('home'))
+            else:
+                current_pw = request.form.get('current_password_disable')
+                stored_hash = cfg.get('AUTH_HASH')
+                if not stored_hash or not check_password_hash(stored_hash, current_pw): flash("Incorrect password.")
+                else:
+                    cfg['AUTH_DISABLED'] = True
+                    cfg.pop('AUTH_USER', None)
+                    cfg.pop('AUTH_HASH', None)
+                    save_config(cfg)
+                    session.clear()
+                    return redirect(url_for('home'))
+        return redirect(url_for('settings'))
+
+    # Helper for Time Selects (24h -> 12h)
+    cron_time = cfg.get('CRON_TIME', '03:00')
+    try:
+        h_24_str, m_str = cron_time.split(':')
+        h_24 = int(h_24_str)
+        c_minute = m_str
+        c_ampm = 'AM' if h_24 < 12 else 'PM'
+        c_hour_12 = h_24
+        if h_24 == 0: c_hour_12 = 12
+        elif h_24 > 12: c_hour_12 = h_24 - 12
+        c_hour = f"{c_hour_12:02d}"
+    except:
+        c_hour, c_minute, c_ampm = '03', '00', 'AM'
+
+    content = """
+    <div style="max-width: 800px; margin: 0 auto;">
+        <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none; margin-bottom: 30px;">
+            <h2 style="margin-top:0;">Configuration</h2>
+            <form method="post">
+                <input type="hidden" name="action" value="update_config">
+                <div class="form-group"><label>Plex Server URL</label><input type="text" name="plex_url" value="{{ cfg.PLEX_URL }}" placeholder="http://localhost:32400"></div>
+                <div class="form-group"><label>Plex Token</label><input type="text" name="plex_token" value="{{ cfg.PLEX_TOKEN }}"></div>
+                <div class="form-group"><label>Download Directory</label><input type="text" name="download_dir" value="{{ cfg.DOWNLOAD_BASE_DIR }}"></div>
+                <div class="form-group"><label>Asset Folder Style</label>
+                    <select name="asset_style">
+                        <option value="ASSET_FOLDERS" {% if cfg.ASSET_STYLE == 'ASSET_FOLDERS' %}selected{% endif %}>Asset Folders (Kometa Default)</option>
+                        <option value="NO_ASSET_FOLDERS" {% if cfg.ASSET_STYLE == 'NO_ASSET_FOLDERS' %}selected{% endif %}>No Asset Folders (Flat)</option>
+                    </select>
+                    <small style="color:var(--text-muted); display:block; margin-top:5px;">
+                        <strong>Asset Folders:</strong> Movies/Show Name/poster.jpg<br>
+                        <strong>No Asset Folders:</strong> Movies/Movie Name.jpg
+                    </small>
+                </div>
+                <div class="form-group"><label>History File Name</label><input type="text" name="history_file" value="{{ cfg.HISTORY_FILE }}"></div>
+                
+                <div class="form-group" style="display:flex; align-items:center; gap:10px; margin-top: 15px;">
+                    <input type="checkbox" name="cron_logging" id="cron_logging" style="width:auto;" {% if cfg.VERBOSE_LOGGING %}checked{% endif %}>
+                    <label for="cron_logging" style="margin:0; font-weight: 400;">Enable Global Verbose Logging</label>
+                </div>
+
+                <div class="form-group"><label>Manage Hidden Libraries</label>
+                    {% if all_libs %}
+                        <div style="max-height: 200px; overflow-y: auto; background: #141719; border: 1px solid #4b5563; border-radius: 8px; padding: 10px;">
+                            {% for lib in all_libs %}
+                            <div style="display:flex; align-items:center; margin-bottom:8px;">
+                                <input type="checkbox" name="ignored_libs" value="{{ lib.title }}" id="lib_{{ loop.index }}" {% if lib.title in cfg.IGNORED_LIBRARIES %}checked{% endif %} style="width:auto; margin-right:10px;">
+                                <label for="lib_{{ loop.index }}" style="margin:0; font-weight:400; color:var(--text); cursor:pointer;">{{ lib.title }}</label>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    {% else %}<p>Connect Plex to see libraries.</p>{% endif %}
+                </div>
+                <div style="margin-top: 30px; border-top: 1px solid #4b5563; padding-top: 20px;">
+                    <h3 style="margin-top:0;">Automated Downloads (Cron)</h3>
+                    <div class="form-group" style="display:flex; align-items:center; gap:10px;">
+                        <input type="checkbox" name="cron_enabled" id="cron_enabled" style="width:auto;" {% if cfg.CRON_ENABLED %}checked{% endif %}>
+                        <label for="cron_enabled" style="margin:0;">Enable Schedule</label>
+                    </div>
+                    <div class="form-group" style="display:flex; align-items:center; gap:10px;">
+                        <input type="checkbox" name="cron_download_backgrounds" id="cron_download_backgrounds" style="width:auto;" {% if cfg.CRON_DOWNLOAD_BACKGROUNDS %}checked{% endif %}>
+                        <label for="cron_download_backgrounds" style="margin:0;">Download Backgrounds</label>
+                    </div>
+
+                    <div class="form-group" style="display: flex; gap: 20px;">
+                        <div style="flex: 1;">
+                            <label>Run On Day</label>
+                            <select name="cron_day">
+                                <option value="DAILY" {% if cfg.CRON_DAY == 'DAILY' %}selected{% endif %}>Every Day</option>
+                                <option value="MONDAY" {% if cfg.CRON_DAY == 'MONDAY' %}selected{% endif %}>Monday</option>
+                                <option value="TUESDAY" {% if cfg.CRON_DAY == 'TUESDAY' %}selected{% endif %}>Tuesday</option>
+                                <option value="WEDNESDAY" {% if cfg.CRON_DAY == 'WEDNESDAY' %}selected{% endif %}>Wednesday</option>
+                                <option value="THURSDAY" {% if cfg.CRON_DAY == 'THURSDAY' %}selected{% endif %}>Thursday</option>
+                                <option value="FRIDAY" {% if cfg.CRON_DAY == 'FRIDAY' %}selected{% endif %}>Friday</option>
+                                <option value="SATURDAY" {% if cfg.CRON_DAY == 'SATURDAY' %}selected{% endif %}>Saturday</option>
+                                <option value="SUNDAY" {% if cfg.CRON_DAY == 'SUNDAY' %}selected{% endif %}>Sunday</option>
+                            </select>
+                        </div>
+                        <div style="flex: 1;">
+                            <label>Run At</label>
+                            <div style="display:flex; gap:10px;">
+                                <select name="cron_hour" style="flex:1;">
+                                    {% for h in range(1, 13) %}
+                                        <option value="{{ '%02d' % h }}" {% if ('%02d' % h) == c_hour %}selected{% endif %}>{{ h }}</option>
+                                    {% endfor %}
+                                </select>
+                                <select name="cron_minute" style="flex:1;">
+                                    {% for m in range(0, 60) %}
+                                        <option value="{{ '%02d' % m }}" {% if ('%02d' % m) == c_minute %}selected{% endif %}>{{ '%02d' % m }}</option>
+                                    {% endfor %}
+                                </select>
+                                <select name="cron_ampm" style="flex:1;">
+                                    <option value="AM" {% if c_ampm == 'AM' %}selected{% endif %}>AM</option>
+                                    <option value="PM" {% if c_ampm == 'PM' %}selected{% endif %}>PM</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-group"><label>Libraries to Run On</label>
+                        {% if all_libs %}
+                            <div style="max-height: 150px; overflow-y: auto; background: #141719; border: 1px solid #4b5563; border-radius: 8px; padding: 10px;">
+                                {% for lib in all_libs %}
+                                <div style="display:flex; align-items:center; margin-bottom:8px;">
+                                    <input type="checkbox" name="cron_libs" value="{{ lib.title }}" id="cron_lib_{{ loop.index }}" {% if lib.title in cfg.CRON_LIBRARIES %}checked{% endif %} style="width:auto; margin-right:10px;">
+                                    <label for="cron_lib_{{ loop.index }}" style="margin:0; font-weight:400; color:var(--text); cursor:pointer;">{{ lib.title }}</label>
+                                </div>
+                                {% endfor %}
+                            </div>
+                        {% endif %}
+                    </div>
+                    <div class="form-group"><label>Mode</label>
+                        <select name="cron_mode">
+                            <option value="RANDOM" {% if cfg.CRON_MODE == 'RANDOM' %}selected{% endif %}>Random (No Uploads)</option>
+                            <option value="SPECIFIC_PROVIDER" {% if cfg.CRON_MODE == 'SPECIFIC_PROVIDER' %}selected{% endif %}>First from Provider</option>
+                            <option value="RANDOM_PROVIDER" {% if cfg.CRON_MODE == 'RANDOM_PROVIDER' %}selected{% endif %}>Random from Provider</option>
+                        </select>
+                    </div>
+                    <div class="form-group"><label>Provider Name</label>
+                        <select name="cron_provider">
+                            <option value="tmdb" {% if cfg.CRON_PROVIDER == 'tmdb' %}selected{% endif %}>TMDB</option>
+                            <option value="tvdb" {% if cfg.CRON_PROVIDER == 'tvdb' %}selected{% endif %}>TVDB</option>
+                            <option value="fanart" {% if cfg.CRON_PROVIDER == 'fanart' %}selected{% endif %}>Fanart.tv</option>
+                            <option value="gracenote" {% if cfg.CRON_PROVIDER == 'gracenote' %}selected{% endif %}>Gracenote</option>
+                            <option value="movieposterdb" {% if cfg.CRON_PROVIDER == 'movieposterdb' %}selected{% endif %}>MoviePosterDB</option>
+                            <option value="local" {% if cfg.CRON_PROVIDER == 'local' %}selected{% endif %}>Local</option>
+                        </select>
+                    </div>
+                </div>
+                <button type="submit" class="btn">Save & Connect</button>
+            </form>
+        </div>
+        <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none; margin-bottom: 30px;">
+            <h2 style="margin-top:0;">File Migration</h2>
+            <form method="post" onsubmit="return confirm('Migrate files?');">
+                <input type="hidden" name="action" value="migrate_assets">
+                <div class="form-group"><label>Convert To:</label>
+                    <select name="target_style">
+                        <option value="ASSET_FOLDERS">Asset Folders</option>
+                        <option value="NO_ASSET_FOLDERS">No Asset Folders</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn">Migrate Files</button>
+            </form>
+        </div>
+        <div class="card" style="padding: 30px; cursor: default; transform: none; box-shadow: none;">
+            <h2 style="margin-top:0;">Security</h2>
+            {% if is_unconfigured or auth_disabled %}
+                {% if auth_disabled %}<p>Auth disabled. Use form to enable.</p>{% else %}<p>Auth not set up.</p>{% endif %}
+                <form method="post" style="margin-bottom:30px">
+                    <input type="hidden" name="action" value="create_account">
+                    <div class="form-group"><label>Username</label><input type="text" name="new_username" required></div>
+                    <div class="form-group"><label>Password</label><input type="password" name="new_password" required></div>
+                    <div class="form-group"><label>Confirm</label><input type="password" name="confirm_password" required></div>
+                    <button type="submit" class="btn">Create Account</button>
+                </form>
+                {% if not auth_disabled %}
+                <form method="post" onsubmit="return confirm('Disable auth?');">
+                    <input type="hidden" name="action" value="disable_auth">
+                    <button type="submit" class="btn btn-danger">Disable Auth</button>
+                </form>
+                {% endif %}
+            {% else %}
+                <form method="post" style="margin-bottom:30px">
+                    <input type="hidden" name="action" value="change_password">
+                    <div class="form-group"><label>Username</label><input type="text" value="{{ cfg.AUTH_USER }}" disabled></div>
+                    <div class="form-group"><label>Current Password</label><input type="password" name="current_password" required></div>
+                    <div class="form-group"><label>New Password</label><input type="password" name="new_password" required></div>
+                    <div class="form-group"><label>Confirm</label><input type="password" name="confirm_password" required></div>
+                    <button type="submit" class="btn">Update Password</button>
+                </form>
+                <form method="post" onsubmit="return confirm('Disable auth?');">
+                    <input type="hidden" name="action" value="disable_auth">
+                    <div class="form-group"><label>Password</label><input type="password" name="current_password_disable" required></div>
+                    <button type="submit" class="btn btn-danger">Disable Auth</button>
+                </form>
+            {% endif %}
+        </div>
+    </div>
+    """
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=cfg, all_libs=all_libs, c_hour=c_hour, c_minute=c_minute, c_ampm=c_ampm, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
+
 @app.route('/library/<lib_id>')
 def view_library(lib_id):
     if not plex: return redirect(url_for('settings'))
-    try:
-        lib = plex.library.sectionByID(int(lib_id))
-    except (ValueError, NotFound, Unauthorized):
-        flash("Library not found or unauthorized.")
-        return redirect('/')
-
-    # PAGINATION LOGIC
+    try: lib = plex.library.sectionByID(int(lib_id))
+    except: return redirect('/')
+    
     page = request.args.get('page', 1, type=int)
     per_page = 50
     offset = (page - 1) * per_page
-    
-    # Use search to fetch only the needed slice.
     total_items = lib.totalSize
     items = lib.search(maxresults=per_page, container_start=offset)
-    
     total_pages = math.ceil(total_items / per_page)
     
-    # 1. Load History (Manual Completions + Downloads)
     history = load_history_data()
-    all_history_keys = list(history['downloads'].keys()) + list(history['overrides'])
-    history_keys_set = set(all_history_keys)
+    all_keys = list(history['downloads'].keys()) + list(history['overrides'])
+    valid_keys = [int(k) for k in set(all_keys) if k.isdigit()]
     
-    # 2. Fetch "Global Done" items from history
-    valid_keys = [int(k) for k in history_keys_set if k.isdigit()]
-    done_objects_from_history = []
+    done_objs = []
     if valid_keys:
-        try:
-            done_objects_from_history = lib.search(id=valid_keys)
-        except:
-            pass
-
-    done_ids_map = {item.ratingKey: item for item in done_objects_from_history}
-
-    # SELF-HEALING: Check if manual deletes happened for historical items
-    keys_to_remove = []
-    for key, item in list(done_ids_map.items()):
-        status = get_item_status(item, lib.title)
-        if status != 'complete':
-            keys_to_remove.append(key)
+        try: done_objs = lib.search(id=valid_keys)
+        except: pass
     
-    # Remove from local map and JSON
-    if keys_to_remove:
-        for k in keys_to_remove:
+    done_ids_map = {item.ratingKey: item for item in done_objs}
+    
+    # Self Healing
+    keys_rm = []
+    for key, item in list(done_ids_map.items()):
+        if get_item_status(item, lib.title) != 'complete': keys_rm.append(key)
+    if keys_rm:
+        for k in keys_rm:
             del done_ids_map[k]
-            k_str = str(k)
-            if k_str in history['downloads']: del history['downloads'][k_str]
-            if k_str in history['overrides']: history['overrides'].remove(k_str)
+            if str(k) in history['downloads']: del history['downloads'][str(k)]
+            if str(k) in history['overrides']: history['overrides'].remove(str(k))
         save_history_data(history)
 
     todo_items = []
     partial_items = []
-    
-    # 3. Process the CURRENT PAGE items
-    new_found_items = []
+    new_found = []
     
     for i in items:
         status = get_item_status(i, lib.title)
-        
         if status == 'complete':
             if i.ratingKey not in done_ids_map:
                 done_ids_map[i.ratingKey] = i
-                # SELF-HEALING: Add to history if found on disk but missing in JSON
-                new_found_items.append(i.ratingKey)
+                new_found.append(i.ratingKey)
         elif status == 'partial':
             thumb = i.thumbUrl if i.thumb else ''
             partial_items.append({'title': i.title, 'ratingKey': i.ratingKey, 'thumbUrl': thumb})
@@ -1403,188 +1085,128 @@ def view_library(lib_id):
             thumb = i.thumbUrl if i.thumb else ''
             todo_items.append({'title': i.title, 'ratingKey': i.ratingKey, 'thumbUrl': thumb})
 
-    # Save new found items to history
-    if new_found_items:
-        for k in new_found_items:
-            # We don't have the URL, but we mark it as downloaded to persist state
-            history['downloads'][str(k)] = "restored_from_disk"
+    if new_found:
+        for k in new_found: history['downloads'][str(k)] = "restored"
         save_history_data(history)
 
-    # 4. Construct the Final "Already Downloaded" list
     done_items_list = []
     for key, item in done_ids_map.items():
         thumb = item.thumbUrl if item.thumb else ''
         done_items_list.append({'title': item.title, 'ratingKey': item.ratingKey, 'thumbUrl': thumb})
-        
     done_items_list.sort(key=lambda x: x['title'])
 
-    pagination_block = """
-    <div class="pagination" style="margin: 30px 0; border-top: 1px solid #444; padding-top: 20px;">
-        <div style="display: flex; align-items: center; justify-content: center; gap: 15px;">
-            {% if page > 1 %}
-                <a href="?page={{ page - 1 }}" class="page-btn">&laquo; Prev</a>
-            {% else %}
-                <span class="page-btn" style="opacity:0.5; cursor:not-allowed;">&laquo; Prev</span>
-            {% endif %}
-            
-            <form action="" method="get" style="display:flex; align-items:center; gap:10px; margin:0;">
-                <label style="margin:0; color:var(--text-muted);">Page</label>
-                <select name="page" onchange="this.form.submit()" style="padding: 8px; border-radius: 6px; background: var(--bg); color: var(--text); border: 1px solid #4b5563; cursor: pointer; min-width: 80px;">
-                    {% for p in range(1, total_pages + 1) %}
-                        <option value="{{ p }}" {% if p == page %}selected{% endif %}>{{ p }}</option>
-                    {% endfor %}
-                </select>
-                <span style="color:var(--text-muted);">of {{ total_pages }}</span>
-            </form>
-
-            {% if page < total_pages %}
-                <a href="?page={{ page + 1 }}" class="page-btn">Next &raquo;</a>
-            {% else %}
-                <span class="page-btn" style="opacity:0.5; cursor:not-allowed;">Next &raquo;</span>
-            {% endif %}
-        </div>
-    </div>
-    """
-
-    content = pagination_block + """
+    pagination_block = """<div class="pagination" style="margin:30px 0;border-top:1px solid #444;padding-top:20px"><div style="display:flex;align-items:center;justify-content:center;gap:15px">"""
+    if page > 1: pagination_block += f'<a href="?page={page-1}" class="page-btn">&laquo; Prev</a>'
+    else: pagination_block += '<span class="page-btn" style="opacity:0.5;cursor:not-allowed">&laquo; Prev</span>'
     
-    {% if todo_items %}
-    <div class="section-header">
-        <h2>Missing Posters</h2>
-        <span>{{ todo_items|length }} on this page</span>
-    </div>
-    <div class="grid">
-        {% for item in todo_items %}
-            <a href="/item/{{ item.ratingKey }}" class="card">
-                <img src="{{ item.thumbUrl }}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'">
-                <div class="title">{{ item.title }}</div>
-            </a>
-        {% endfor %}
-    </div>
-    {% endif %}
-
-    {% if partial_items %}
-    <div class="section-header">
-        <h2 style="color: var(--warning);">Half Missing</h2>
-        <span>{{ partial_items|length }} on this page</span>
-    </div>
-    <div class="grid">
-        {% for item in partial_items %}
-            <a href="/item/{{ item.ratingKey }}" class="card" style="border: 2px solid var(--warning);">
-                <img src="{{ item.thumbUrl }}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'">
-                <div class="title">⚠️ {{ item.title }}</div>
-            </a>
-        {% endfor %}
-    </div>
-    {% endif %}
-
-    {% if done_items %}
-    <div class="section-header">
-        <h2 style="color: var(--accent);">Already Downloaded (All Pages)</h2>
-        <span>{{ done_items|length }} total</span>
-    </div>
-    <div class="grid">
-        {% for item in done_items %}
-            <a href="/item/{{ item.ratingKey }}" class="card" style="opacity: 0.7;">
-                <img src="{{ item.thumbUrl }}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'">
-                <div class="title">✅ {{ item.title }}</div>
-            </a>
-        {% endfor %}
-    </div>
-    {% endif %}
+    pagination_block += f"""<form action="" method="get" style="display:flex;align-items:center;gap:10px;margin:0"><label style="margin:0;color:var(--text-muted)">Page</label><select name="page" onchange="this.form.submit()" style="padding:8px;border-radius:6px;background:var(--bg);color:var(--text);border:1px solid #4b5563;cursor:pointer;min-width:80px">"""
+    for p in range(1, total_pages + 1):
+        sel = 'selected' if p == page else ''
+        pagination_block += f'<option value="{p}" {sel}>{p}</option>'
+    pagination_block += f"""</select><span style="color:var(--text-muted)">of {total_pages}</span></form>"""
     
-    {% if not todo_items and not partial_items and not done_items %}
-        <p>No items found in this library section.</p>
-    {% endif %}
-    
-    """ + pagination_block
+    if page < total_pages: pagination_block += f'<a href="?page={page+1}" class="page-btn">Next &raquo;</a>'
+    else: pagination_block += '<span class="page-btn" style="opacity:0.5;cursor:not-allowed">Next &raquo;</span>'
+    pagination_block += "</div></div>"
 
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, 
-        todo_items=todo_items, partial_items=partial_items, done_items=done_items_list, 
-        title=lib.title, page=page, total_pages=total_pages,
-        breadcrumbs=[(lib.title, '#')], toggle_override=False)
+    content = pagination_block
+    if todo_items:
+        content += f"""<div class="section-header"><h2>Missing Posters</h2><span>{len(todo_items)} on page</span></div><div class="grid">"""
+        for i in todo_items: content += f"""<a href="/item/{i['ratingKey']}" class="card"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{i['title']}</div></a>"""
+        content += "</div>"
+    if partial_items:
+        content += f"""<div class="section-header"><h2 style="color:var(--warning)">Half Missing</h2><span>{len(partial_items)} on page</span></div><div class="grid">"""
+        for i in partial_items: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="border:2px solid var(--warning)"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">⚠️ {i['title']}</div></a>"""
+        content += "</div>"
+    if done_items_list:
+        content += f"""<div class="section-header"><h2 style="color:var(--accent)">Already Downloaded</h2><span>{len(done_items_list)} total</span></div><div class="grid">"""
+        for i in done_items_list: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="opacity:0.7"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">✅ {i['title']}</div></a>"""
+        content += "</div>"
+    if not todo_items and not partial_items and not done_items_list: content += "<p>No items found.</p>"
+    content += pagination_block
+
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=lib.title, breadcrumbs=[(lib.title, '#')], toggle_override=False)
 
 @app.route('/item/<rating_key>')
 def view_item(rating_key):
     if not plex: return redirect(url_for('settings'))
-    try:
-        item = plex.fetchItem(int(rating_key))
-    except NotFound:
-        return "Item not found", 404
-
+    try: item = plex.fetchItem(int(rating_key))
+    except: return "Not Found", 404
+    
     is_show = item.type == 'show'
     posters = item.posters()
+    backgrounds = item.arts()
     folder_name = get_physical_folder_name(item)
     lib = item.section()
     
-    selected_url = get_history_url(rating_key)
+    sel_poster = get_history_url(rating_key, 'poster')
+    sel_bg = get_history_url(rating_key, 'background')
     
-    # Validation: Only allow highlighting if the file actually exists
-    if selected_url:
-        file_path = get_target_file_path(item, lib.title)
-        if not file_path or not os.path.exists(file_path):
-            selected_url = None # Clear highlight if missing
-            
-    override_status = is_overridden(rating_key) if is_show else False
+    if sel_poster and not check_file_exists(item, lib.title, 'poster'): sel_poster = None
+    if sel_bg and not check_file_exists(item, lib.title, 'background'): sel_bg = None
     
-    seasons = []
-    if is_show:
-        seasons = item.seasons()
-    
-    # Calculate target display path based on current settings
+    seasons = item.seasons() if is_show else []
     target_path = get_target_file_path(item, lib.title)
-    # Simplify for display (remove base dir)
+    
     cfg = get_config()
-    base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
-    if not os.path.isabs(base_dir) and DATA_DIR != '.':
-        base_dir = os.path.join(DATA_DIR, base_dir)
-        
-    rel_path = os.path.relpath(target_path, base_dir) if target_path else "Unknown"
+    base_dir = cfg.get('DOWNLOAD_BASE_DIR', '')
+    if not os.path.isabs(base_dir) and DATA_DIR != '.': base_dir = os.path.join(DATA_DIR, base_dir)
+    rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
 
-    content = """
-        <div class="path-info">Target: <strong>.../{{ rel_path }}</strong></div>
+    content = f"""
+    <div class="path-info">Target Folder: <strong>.../{rel_path}/</strong></div>
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button>
+        <button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button>
+    </div>
+    
+    <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
+    for p in posters:
+        p_url = get_poster_url(p)
+        sel_class = 'selected' if p_url == sel_poster else ''
+        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        content += f"""
+        <form action="/download" method="post" class="poster-card {sel_class}">
+            <div class="img-container">
+                {badge}
+                <img src="{p_url}" loading="lazy">
+                <div class="provider-badge">{format_provider(p.provider)}</div>
+            </div>
+            <input type="hidden" name="img_url" value="{p_url}">
+            <input type="hidden" name="rating_key" value="{item.ratingKey}">
+            <input type="hidden" name="img_type" value="poster">
+            <button type="submit" class="btn">Download</button>
+        </form>"""
+    content += "</div></div>"
+    
+    content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
+    for bg in backgrounds:
+        b_url = get_poster_url(bg)
+        sel_class = 'selected' if b_url == sel_bg else ''
+        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        content += f"""
+        <form action="/download" method="post" class="background-card {sel_class}">
+            <div class="img-container">
+                {badge}
+                <img src="{b_url}" loading="lazy">
+                <div class="provider-badge">{format_provider(bg.provider)}</div>
+            </div>
+            <input type="hidden" name="img_url" value="{b_url}">
+            <input type="hidden" name="rating_key" value="{item.ratingKey}">
+            <input type="hidden" name="img_type" value="background">
+            <button type="submit" class="btn">Download</button>
+        </form>"""
+    content += "</div></div>"
+    
+    if is_show:
+        content += f"""<div class="section-header"><h2>Seasons</h2></div><div class="grid">"""
+        for s in seasons:
+            thumb = s.thumbUrl if s.thumb else ''
+            content += f"""<a href="/season/{s.ratingKey}" class="card"><img src="{thumb}" loading="lazy"><div class="title">{s.title}</div></a>"""
+        content += "</div>"
         
-        <div class="poster-grid">
-            {% for poster in posters %}
-                {% set p_url = poster_url(poster) %}
-                {% set is_selected = (p_url == selected_url) %}
-                
-                <form action="/download" method="post" class="poster-card {% if is_selected %}selected{% endif %}">
-                    {% if is_selected %}<div class="selected-badge">CURRENT</div>{% endif %}
-                    <img src="{{ p_url }}" loading="lazy">
-                    <input type="hidden" name="img_url" value="{{ p_url }}">
-                    <input type="hidden" name="rating_key" value="{{ item.ratingKey }}">
-                    <button type="submit" class="btn">{% if is_selected %}Re-Download{% else %}Download{% endif %}</button>
-                </form>
-            {% endfor %}
-        </div>
-
-        {% if is_show %}
-            <div class="section-header">
-                <h2>Seasons</h2>
-                <span>{{ seasons|length }} seasons</span>
-            </div>
-            <div class="grid">
-                {% for season in seasons %}
-                    <a href="/season/{{ season.ratingKey }}" class="card">
-                        <img src="{{ season_thumb(season) }}" loading="lazy">
-                        <div class="title">{{ season.title }}</div>
-                    </a>
-                {% endfor %}
-            </div>
-        {% endif %}
-    """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, 
-        item=item, is_show=is_show, posters=posters, seasons=seasons, 
-        rel_path=rel_path, lib_title=lib.title,
-        poster_url=get_poster_url, 
-        season_thumb=lambda s: s.thumbUrl,
-        selected_url=selected_url,
-        title=item.title,
-        toggle_override=is_show,
-        is_overridden=override_status,
-        rating_key=item.ratingKey,
-        breadcrumbs=[(lib.title, f'/library/{lib.key}'), (item.title, '#')])
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=item.title, breadcrumbs=[(lib.title, f'/library/{lib.key}'), (item.title, '#')], 
+                                  rating_key=item.ratingKey, toggle_override=is_show, is_overridden=is_overridden(item.ratingKey))
 
 @app.route('/season/<rating_key>')
 def view_season(rating_key):
@@ -1592,115 +1214,88 @@ def view_season(rating_key):
     season = plex.fetchItem(int(rating_key))
     show = season.show()
     posters = season.posters()
+    backgrounds = season.arts()
     lib = show.section()
     
-    selected_url = get_history_url(rating_key)
+    sel_poster = get_history_url(rating_key, 'poster')
+    sel_bg = get_history_url(rating_key, 'background')
     
-    # Validation
-    if selected_url:
-        file_path = get_target_file_path(season, lib.title)
-        if not file_path or not os.path.exists(file_path):
-            selected_url = None
-
+    if sel_poster and not check_file_exists(season, lib.title, 'poster'): sel_poster = None
+    if sel_bg and not check_file_exists(season, lib.title, 'background'): sel_bg = None
+    
     target_path = get_target_file_path(season, lib.title)
-    
     cfg = get_config()
-    base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
-    if not os.path.isabs(base_dir) and DATA_DIR != '.':
-        base_dir = os.path.join(DATA_DIR, base_dir)
+    base_dir = cfg.get('DOWNLOAD_BASE_DIR', '')
+    if not os.path.isabs(base_dir) and DATA_DIR != '.': base_dir = os.path.join(DATA_DIR, base_dir)
+    rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
     
-    rel_path = os.path.relpath(target_path, base_dir) if target_path else "Unknown"
-
-    content = """
-        <div class="path-info">Target: <strong>.../{{ rel_path }}</strong></div>
-        
-        <div class="poster-grid">
-            {% for poster in posters %}
-                {% set p_url = poster_url(poster) %}
-                {% set is_selected = (p_url == selected_url) %}
-                
-                <form action="/download" method="post" class="poster-card {% if is_selected %}selected{% endif %}">
-                    {% if is_selected %}<div class="selected-badge">CURRENT</div>{% endif %}
-                    <img src="{{ p_url }}" loading="lazy">
-                    <input type="hidden" name="img_url" value="{{ p_url }}">
-                    <input type="hidden" name="rating_key" value="{{ season.ratingKey }}">
-                    <button type="submit" class="btn">{% if is_selected %}Re-Download{% else %}Download{% endif %}</button>
-                </form>
-            {% endfor %}
-        </div>
-    """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, 
-        show=show, season=season, posters=posters, 
-        rel_path=rel_path, lib_title=lib.title,
-        poster_url=get_poster_url,
-        selected_url=selected_url,
-        title=f"{show.title} - {season.title}",
-        toggle_override=False,
-        breadcrumbs=[(lib.title, f'/library/{lib.key}'), (show.title, f'/item/{show.ratingKey}'), (season.title, '#')])
+    content = f"""
+    <div class="path-info">Target: <strong>.../{rel_path}/</strong></div>
+    <div class="tabs"><button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button><button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button></div>
+    
+    <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
+    for p in posters:
+        p_url = get_poster_url(p)
+        sel_class = 'selected' if p_url == sel_poster else ''
+        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        content += f"""
+        <form action="/download" method="post" class="poster-card {sel_class}">
+            <div class="img-container">{badge}<img src="{p_url}" loading="lazy"><div class="provider-badge">{format_provider(p.provider)}</div></div>
+            <input type="hidden" name="img_url" value="{{ p_url }}">
+            <input type="hidden" name="rating_key" value="{{ season.ratingKey }}">
+            <input type="hidden" name="img_type" value="poster">
+            <button type="submit" class="btn">Download</button>
+        </form>"""
+    content += "</div></div>"
+    
+    content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
+    for bg in backgrounds:
+        b_url = get_poster_url(bg)
+        sel_class = 'selected' if b_url == sel_bg else ''
+        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        content += f"""
+        <form action="/download" method="post" class="background-card {sel_class}">
+            <div class="img-container">{badge}<img src="{b_url}" loading="lazy"><div class="provider-badge">{format_provider(bg.provider)}</div></div>
+            <input type="hidden" name="img_url" value="{{ b_url }}">
+            <input type="hidden" name="rating_key" value="{{ season.ratingKey }}">
+            <input type="hidden" name="img_type" value="background">
+            <button type="submit" class="btn">Download</button>
+        </form>"""
+    content += "</div></div>"
+    
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=f"{show.title} - {season.title}", breadcrumbs=[(lib.title, f'/library/{lib.key}'), (show.title, f'/item/{show.ratingKey}'), (season.title, '#')], toggle_override=False)
 
 @app.route('/download', methods=['POST'])
 def download():
     if not plex: return redirect(url_for('settings'))
     img_url = request.form.get('img_url')
     rating_key = request.form.get('rating_key')
-    
-    if not rating_key:
-        flash("Error: Missing Media ID")
-        return redirect(request.referrer)
-
+    img_type = request.form.get('img_type', 'poster')
     try:
         item = plex.fetchItem(int(rating_key))
         lib_title = item.section().title
-        
-        # New: Get the exact target file path (directory + filename)
-        save_path = get_target_file_path(item, lib_title)
-        
-        if not save_path:
-            flash("Error: Could not determine save path.")
-            return redirect(request.referrer)
-
-        # Create directories
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-        r = requests.get(img_url, stream=True)
-        if r.status_code == 200:
-            with open(save_path, 'wb') as f:
-                for chunk in r.iter_content(1024):
-                    f.write(chunk)
-            
-            save_download_history(rating_key, img_url)
-            flash(f"Saved poster to: {save_path}")
-        else:
-            flash("Failed to download image from Plex.")
-            
-    except Exception as e:
-        flash(f"Error processing download: {e}")
-
+        save_path = get_target_file_path(item, lib_title, img_type=img_type)
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            r = requests.get(img_url, stream=True)
+            if r.status_code == 200:
+                with open(save_path, 'wb') as f:
+                    for chunk in r.iter_content(1024): f.write(chunk)
+                save_download_history(rating_key, img_url, img_type)
+                flash(f"Saved {img_type}!")
+            else: flash("Download failed.")
+    except Exception as e: flash(f"Error: {e}")
     return redirect(request.referrer)
 
 @app.route('/toggle_complete', methods=['POST'])
 def toggle_complete():
     rating_key = request.form.get('rating_key')
     if rating_key:
-        new_status = toggle_override_status(rating_key)
-        if new_status:
-            flash("Show marked as Complete (Manual Override)")
-        else:
-            flash("Override removed")
-            
+        toggle_override_status(rating_key)
+        flash("Status toggled.")
     return redirect(request.referrer)
 
 if __name__ == '__main__':
-    # Initial setup if config doesn't exist
-    if not os.path.exists(CONFIG_FILE):
-        save_config(DEFAULT_CONFIG)
-        
-    cfg = get_config()
-    base_dir = cfg.get('DOWNLOAD_BASE_DIR', 'downloaded_posters')
-    
-    if not os.path.exists(base_dir):
-        os.makedirs(base_dir)
-    
-    print(f"Starting WebUI on http://0.0.0.0:5000")
-    print(f"Go to Settings to configure Plex connection.")
+    if not os.path.exists(CONFIG_FILE): save_config(DEFAULT_CONFIG)
+    if not os.path.exists(DEFAULT_CONFIG['DOWNLOAD_BASE_DIR']): os.makedirs(DEFAULT_CONFIG['DOWNLOAD_BASE_DIR'])
     app.run(host='0.0.0.0', port=5000, debug=True)
