@@ -9,6 +9,9 @@ import threading
 import time
 import random
 import datetime
+import ipaddress
+import socket
+from urllib.parse import urlparse
 # Try to import ZoneInfo for timezone support (Python 3.9+)
 try:
     from zoneinfo import ZoneInfo
@@ -244,6 +247,49 @@ def check_file_exists(item, lib_title=None, img_type='poster'):
     if target_path:
         return os.path.exists(target_path)
     return False
+
+def validate_image_url(url):
+    """Validate a URL to prevent SSRF attacks.
+
+    Allows http/https URLs that are either:
+    - The configured Plex server host (may be localhost/private IP by design), or
+    - A public (non-private, non-reserved) IP/hostname.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        # Resolve to IP for validation
+        try:
+            resolved_ip = socket.getaddrinfo(hostname, None)[0][4][0]
+        except socket.gaierror:
+            return False
+        addr = ipaddress.ip_address(resolved_ip)
+
+        # Always allow the configured Plex server host so poster downloads work
+        # even when Plex lives on localhost or a private network address.
+        cfg = get_config()
+        plex_url = cfg.get('PLEX_URL', '')
+        plex_host = urlparse(plex_url).hostname if plex_url else None
+        if plex_host:
+            try:
+                plex_ip = socket.getaddrinfo(plex_host, None)[0][4][0]
+                if resolved_ip == plex_ip:
+                    return True
+            except socket.gaierror:
+                pass
+
+        # For all other hosts, block private/loopback/reserved addresses.
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
+            return False
+
+        return True
+    except Exception:
+        return False
 
 def get_poster_url(poster):
     key = getattr(poster, 'key', None)
@@ -1401,6 +1447,9 @@ def download():
     img_url = request.form.get('img_url')
     rating_key = request.form.get('rating_key')
     img_type = request.form.get('img_type', 'poster')
+    if not img_url or not validate_image_url(img_url):
+        flash("Invalid or disallowed image URL.")
+        return redirect(request.referrer)
     try:
         item = plex.fetchItem(int(rating_key))
         lib_title = item.section().title
