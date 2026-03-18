@@ -7,8 +7,11 @@ WORKDIR /app
 # Upgrade pip first
 RUN pip install --upgrade pip
 
-# Install dependencies directly to keep the image small
-RUN pip install --no-cache-dir Flask PlexAPI requests cryptography
+# Install dependencies directly to keep the image small.
+# wheel and jaraco.context are pinned to patched versions to address CVEs
+# flagged by Trivy (privilege escalation and path-traversal respectively).
+RUN pip install --no-cache-dir "wheel>=0.45.1" "jaraco.context>=6.0.0" \
+    && pip install --no-cache-dir Flask PlexAPI requests cryptography
 
 # Copy the script into the container
 COPY plex_poster_downloader.py .
