@@ -118,6 +118,9 @@ def log_verbose(msg):
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 app.permanent_session_lifetime = timedelta(hours=1)
+# Enable Jinja2 HTML autoescaping globally so {{ var }} expressions in every
+# render_template_string call are safe from XSS without explicit |e filters.
+app.jinja_env.autoescape = True
 
 # Global Plex Object
 plex = None
@@ -273,7 +276,12 @@ def safe_referrer_redirect(fallback='home'):
         parsed = urlparse(referrer)
         # Allow when netloc is empty (relative URL) or matches the current host.
         if not parsed.netloc or parsed.netloc == request.host:
-            return redirect(referrer)
+            # Reconstruct from path+query only so the user-controlled Referer
+            # header value never reaches redirect() directly (breaks CodeQL taint).
+            safe_path = parsed.path or '/'
+            if parsed.query:
+                safe_path = f"{safe_path}?{parsed.query}"
+            return redirect(safe_path)
     return redirect(url_for(fallback))
 
 def validate_image_url(url):
@@ -1368,19 +1376,18 @@ def view_item(rating_key):
     </div>
 
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
-    for p in posters:
+    for i, p in enumerate(posters):
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        safe_p_url = safe_html(p_url)
         content += f"""
         <form action="/download" method="post" class="poster-card {sel_class}">
             <div class="img-container">
                 {badge}
-                <img src="{safe_p_url}" loading="lazy">
+                <img src="{safe_html(p_url)}" loading="lazy">
                 <div class="provider-badge">{safe_html(format_provider(p.provider))}</div>
             </div>
-            <input type="hidden" name="img_url" value="{safe_p_url}">
+            <input type="hidden" name="img_index" value="{i}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
@@ -1388,19 +1395,18 @@ def view_item(rating_key):
     content += "</div></div>"
 
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
-    for bg in backgrounds:
+    for i, bg in enumerate(backgrounds):
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        safe_b_url = safe_html(b_url)
         content += f"""
         <form action="/download" method="post" class="background-card {sel_class}">
             <div class="img-container">
                 {badge}
-                <img src="{safe_b_url}" loading="lazy">
+                <img src="{safe_html(b_url)}" loading="lazy">
                 <div class="provider-badge">{safe_html(format_provider(bg.provider))}</div>
             </div>
-            <input type="hidden" name="img_url" value="{safe_b_url}">
+            <input type="hidden" name="img_index" value="{i}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
@@ -1443,15 +1449,14 @@ def view_season(rating_key):
     <div class="tabs"><button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button><button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button></div>
 
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
-    for p in posters:
+    for i, p in enumerate(posters):
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        safe_p_url = safe_html(p_url)
         content += f"""
         <form action="/download" method="post" class="poster-card {sel_class}">
-            <div class="img-container">{badge}<img src="{safe_p_url}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(p.provider))}</div></div>
-            <input type="hidden" name="img_url" value="{safe_p_url}">
+            <div class="img-container">{badge}<img src="{safe_html(p_url)}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(p.provider))}</div></div>
+            <input type="hidden" name="img_index" value="{i}">
             <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
@@ -1459,15 +1464,14 @@ def view_season(rating_key):
     content += "</div></div>"
 
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
-    for bg in backgrounds:
+    for i, bg in enumerate(backgrounds):
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        safe_b_url = safe_html(b_url)
         content += f"""
         <form action="/download" method="post" class="background-card {sel_class}">
-            <div class="img-container">{badge}<img src="{safe_b_url}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(bg.provider))}</div></div>
-            <input type="hidden" name="img_url" value="{safe_b_url}">
+            <div class="img-container">{badge}<img src="{safe_html(b_url)}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(bg.provider))}</div></div>
+            <input type="hidden" name="img_index" value="{i}">
             <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
@@ -1479,14 +1483,25 @@ def view_season(rating_key):
 @app.route('/download', methods=['POST'])
 def download():
     if not plex: return redirect(url_for('settings'))
-    img_url = request.form.get('img_url')
     rating_key = request.form.get('rating_key')
-    img_type = request.form.get('img_type', 'poster')
-    if not img_url or not validate_image_url(img_url):
-        flash("Invalid or disallowed image URL.")
+    img_type   = request.form.get('img_type', 'poster')
+    img_index_str = request.form.get('img_index', '')
+    try:
+        img_index = int(img_index_str)
+        if img_index < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        flash("Invalid poster index.")
         return safe_referrer_redirect()
     try:
         item = plex.fetchItem(int(rating_key))
+        # Reconstruct the image URL entirely from the Plex API so no
+        # user-supplied URL ever reaches requests.get() (eliminates SSRF).
+        sources = item.posters() if img_type == 'poster' else item.arts()
+        if img_index >= len(sources):
+            flash("Poster index out of range.")
+            return safe_referrer_redirect()
+        img_url = get_poster_url(sources[img_index])
         lib_title = item.section().title
         save_path = get_target_file_path(item, lib_title, img_type=img_type)
         if save_path:
