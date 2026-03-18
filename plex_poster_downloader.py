@@ -9,6 +9,10 @@ import threading
 import time
 import random
 import datetime
+import ipaddress
+import socket
+from urllib.parse import urlparse
+from markupsafe import escape, Markup
 # Try to import ZoneInfo for timezone support (Python 3.9+)
 try:
     from zoneinfo import ZoneInfo
@@ -245,6 +249,76 @@ def check_file_exists(item, lib_title=None, img_type='poster'):
         return os.path.exists(target_path)
     return False
 
+def safe_html(value):
+    """Escape a value for safe interpolation into HTML strings rendered via
+    render_template_string.  Prevents both XSS (HTML special chars) and SSTI
+    (Jinja2 delimiter injection) by escaping HTML entities and then replacing
+    any remaining { / } characters so Jinja2 never sees them as template tags.
+    Returns a Markup object so the value won't be double-escaped if Jinja2
+    also processes the surrounding template.
+    """
+    text = str(escape(value))                        # HTML-escape < > & " '
+    text = text.replace('{', '&#123;').replace('}', '&#125;')  # kill {{ }}
+    return Markup(text)
+
+def safe_referrer_redirect(fallback='home'):
+    """Redirect to request.referrer only when it points to the same host.
+
+    Prevents open-redirect attacks where an attacker sets the Referer header
+    to an external URL and tricks the server into redirecting victims there.
+    Falls back to url_for(fallback) when the referrer is absent or external.
+    """
+    referrer = request.referrer
+    if referrer:
+        parsed = urlparse(referrer)
+        # Allow when netloc is empty (relative URL) or matches the current host.
+        if not parsed.netloc or parsed.netloc == request.host:
+            return redirect(referrer)
+    return redirect(url_for(fallback))
+
+def validate_image_url(url):
+    """Validate a URL to prevent SSRF attacks.
+
+    Allows http/https URLs that are either:
+    - The configured Plex server host (may be localhost/private IP by design), or
+    - A public (non-private, non-reserved) IP/hostname.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        # Resolve to IP for validation
+        try:
+            resolved_ip = socket.getaddrinfo(hostname, None)[0][4][0]
+        except socket.gaierror:
+            return False
+        addr = ipaddress.ip_address(resolved_ip)
+
+        # Always allow the configured Plex server host so poster downloads work
+        # even when Plex lives on localhost or a private network address.
+        cfg = get_config()
+        plex_url = cfg.get('PLEX_URL', '')
+        plex_host = urlparse(plex_url).hostname if plex_url else None
+        if plex_host:
+            try:
+                plex_ip = socket.getaddrinfo(plex_host, None)[0][4][0]
+                if resolved_ip == plex_ip:
+                    return True
+            except socket.gaierror:
+                pass
+
+        # For all other hosts, block private/loopback/reserved addresses.
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
+            return False
+
+        return True
+    except Exception:
+        return False
+
 def get_poster_url(poster):
     key = getattr(poster, 'key', None)
     if not key: return ""
@@ -444,7 +518,10 @@ def run_cron_job():
                                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                                 key = selected_img.key
                                 url = key if key.startswith('http') else plex.url(key)
-                                
+
+                                if not validate_image_url(url):
+                                    log_verbose(f"Cron: Skipping {item.title} — URL failed SSRF validation: {url}")
+                                    continue
                                 log_verbose(f"Cron: Downloading {img_type} for {item.title} (Provider: {selected_img.provider})")
                                 r = requests.get(url, stream=True)
                                 if r.status_code == 200:
@@ -1242,15 +1319,15 @@ def view_library(lib_id):
     content = pagination_block
     if todo_items:
         content += f"""<div class="section-header"><h2>Missing Posters</h2><span>{len(todo_items)} on page</span></div><div class="grid">"""
-        for i in todo_items: content += f"""<a href="/item/{i['ratingKey']}" class="card"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{i['title']}</div></a>"""
+        for i in todo_items: content += f"""<a href="/item/{i['ratingKey']}" class="card"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{safe_html(i['title'])}</div></a>"""
         content += "</div>"
     if partial_items:
         content += f"""<div class="section-header"><h2 style="color:var(--warning)">Half Missing</h2><span>{len(partial_items)} on page</span></div><div class="grid">"""
-        for i in partial_items: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="border:2px solid var(--warning)"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">⚠️ {i['title']}</div></a>"""
+        for i in partial_items: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="border:2px solid var(--warning)"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">⚠️ {safe_html(i['title'])}</div></a>"""
         content += "</div>"
     if done_items_list:
         content += f"""<div class="section-header"><h2 style="color:var(--accent)">Already Downloaded</h2><span>{len(done_items_list)} total</span></div><div class="grid">"""
-        for i in done_items_list: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="opacity:0.7"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">✅ {i['title']}</div></a>"""
+        for i in done_items_list: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="opacity:0.7"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">✅ {safe_html(i['title'])}</div></a>"""
         content += "</div>"
     if not todo_items and not partial_items and not done_items_list: content += "<p>No items found.</p>"
     content += pagination_block
@@ -1284,55 +1361,57 @@ def view_item(rating_key):
     rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
 
     content = f"""
-    <div class="path-info">Target Folder: <strong>.../{rel_path}/</strong></div>
+    <div class="path-info">Target Folder: <strong>.../{safe_html(rel_path)}/</strong></div>
     <div class="tabs">
         <button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button>
         <button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button>
     </div>
-    
+
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
     for p in posters:
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_p_url = safe_html(p_url)
         content += f"""
         <form action="/download" method="post" class="poster-card {sel_class}">
             <div class="img-container">
                 {badge}
-                <img src="{p_url}" loading="lazy">
-                <div class="provider-badge">{format_provider(p.provider)}</div>
+                <img src="{safe_p_url}" loading="lazy">
+                <div class="provider-badge">{safe_html(format_provider(p.provider))}</div>
             </div>
-            <input type="hidden" name="img_url" value="{p_url}">
+            <input type="hidden" name="img_url" value="{safe_p_url}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
         </form>"""
     content += "</div></div>"
-    
+
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
     for bg in backgrounds:
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_b_url = safe_html(b_url)
         content += f"""
         <form action="/download" method="post" class="background-card {sel_class}">
             <div class="img-container">
                 {badge}
-                <img src="{b_url}" loading="lazy">
-                <div class="provider-badge">{format_provider(bg.provider)}</div>
+                <img src="{safe_b_url}" loading="lazy">
+                <div class="provider-badge">{safe_html(format_provider(bg.provider))}</div>
             </div>
-            <input type="hidden" name="img_url" value="{b_url}">
+            <input type="hidden" name="img_url" value="{safe_b_url}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
         </form>"""
     content += "</div></div>"
-    
+
     if is_show:
         content += f"""<div class="section-header"><h2>Seasons</h2></div><div class="grid">"""
         for s in seasons:
             thumb = s.thumbUrl if s.thumb else ''
-            content += f"""<a href="/season/{s.ratingKey}" class="card"><img src="{thumb}" loading="lazy"><div class="title">{s.title}</div></a>"""
+            content += f"""<a href="/season/{s.ratingKey}" class="card"><img src="{safe_html(thumb)}" loading="lazy"><div class="title">{safe_html(s.title)}</div></a>"""
         content += "</div>"
         
     return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=item.title, breadcrumbs=[(lib.title, f'/library/{lib.key}'), (item.title, '#')], 
@@ -1360,34 +1439,36 @@ def view_season(rating_key):
     rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
     
     content = f"""
-    <div class="path-info">Target: <strong>.../{rel_path}/</strong></div>
+    <div class="path-info">Target: <strong>.../{safe_html(rel_path)}/</strong></div>
     <div class="tabs"><button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button><button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button></div>
-    
+
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
     for p in posters:
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_p_url = safe_html(p_url)
         content += f"""
         <form action="/download" method="post" class="poster-card {sel_class}">
-            <div class="img-container">{badge}<img src="{p_url}" loading="lazy"><div class="provider-badge">{format_provider(p.provider)}</div></div>
-            <input type="hidden" name="img_url" value="{{ p_url }}">
-            <input type="hidden" name="rating_key" value="{{ season.ratingKey }}">
+            <div class="img-container">{badge}<img src="{safe_p_url}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(p.provider))}</div></div>
+            <input type="hidden" name="img_url" value="{safe_p_url}">
+            <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
         </form>"""
     content += "</div></div>"
-    
+
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
     for bg in backgrounds:
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_b_url = safe_html(b_url)
         content += f"""
         <form action="/download" method="post" class="background-card {sel_class}">
-            <div class="img-container">{badge}<img src="{b_url}" loading="lazy"><div class="provider-badge">{format_provider(bg.provider)}</div></div>
-            <input type="hidden" name="img_url" value="{{ b_url }}">
-            <input type="hidden" name="rating_key" value="{{ season.ratingKey }}">
+            <div class="img-container">{badge}<img src="{safe_b_url}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(bg.provider))}</div></div>
+            <input type="hidden" name="img_url" value="{safe_b_url}">
+            <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
         </form>"""
@@ -1401,6 +1482,9 @@ def download():
     img_url = request.form.get('img_url')
     rating_key = request.form.get('rating_key')
     img_type = request.form.get('img_type', 'poster')
+    if not img_url or not validate_image_url(img_url):
+        flash("Invalid or disallowed image URL.")
+        return safe_referrer_redirect()
     try:
         item = plex.fetchItem(int(rating_key))
         lib_title = item.section().title
@@ -1415,7 +1499,7 @@ def download():
                 flash(f"Saved {img_type}!")
             else: flash("Download failed.")
     except Exception as e: flash(f"Error: {e}")
-    return redirect(request.referrer)
+    return safe_referrer_redirect()
 
 @app.route('/toggle_complete', methods=['POST'])
 def toggle_complete():
@@ -1423,9 +1507,12 @@ def toggle_complete():
     if rating_key:
         toggle_override_status(rating_key)
         flash("Status toggled.")
-    return redirect(request.referrer)
+    return safe_referrer_redirect()
 
 if __name__ == '__main__':
     if not os.path.exists(CONFIG_FILE): save_config(DEFAULT_CONFIG)
     if not os.path.exists(DEFAULT_CONFIG['DOWNLOAD_BASE_DIR']): os.makedirs(DEFAULT_CONFIG['DOWNLOAD_BASE_DIR'])
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    _host  = os.environ.get('FLASK_RUN_HOST', '0.0.0.0')
+    _port  = int(os.environ.get('FLASK_RUN_PORT', '5000'))
+    _debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(host=_host, port=_port, debug=_debug)
