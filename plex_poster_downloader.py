@@ -276,16 +276,15 @@ def safe_referrer_redirect(fallback='home'):
         parsed = urlparse(referrer)
         # Allow when netloc is empty (relative URL) or matches the current host.
         if not parsed.netloc or parsed.netloc == request.host:
-            # Whitelist-sanitize path and query through re.sub so no
-            # user-controlled bytes flow directly to redirect() (breaks CodeQL taint).
-            safe_path = re.sub(r'[^a-zA-Z0-9/_\-\.~%@!$&\'()*+,;=:]', '', parsed.path or '/')
-            if not safe_path.startswith('/'):
-                safe_path = '/'
+            # Build a relative-only target (path + query, no scheme/host).
+            target = parsed.path or '/'
             if parsed.query:
-                safe_query = re.sub(r'[^a-zA-Z0-9_\-\.~%@!$&\'()*+,;=:/?]', '', parsed.query)
-                if safe_query:
-                    safe_path = f"{safe_path}?{safe_query}"
-            return redirect(safe_path)
+                target = f"{target}?{parsed.query}"
+            # Re-parse the target and verify it carries no explicit host name,
+            # as recommended by CodeQL's url-redirection guidance.
+            verified = urlparse(target)
+            if not verified.scheme and not verified.netloc:
+                return redirect(target)
     return redirect(url_for(fallback))
 
 def validate_image_url(url):
@@ -1314,37 +1313,60 @@ def view_library(lib_id):
         done_items_list.append({'title': item.title, 'ratingKey': item.ratingKey, 'thumbUrl': thumb})
     done_items_list.sort(key=lambda x: x['title'])
 
-    pagination_block = """<div class="pagination" style="margin:30px 0;border-top:1px solid #444;padding-top:20px"><div style="display:flex;align-items:center;justify-content:center;gap:15px">"""
-    if page > 1: pagination_block += f'<a href="?page={page-1}" class="page-btn">&laquo; Prev</a>'
-    else: pagination_block += '<span class="page-btn" style="opacity:0.5;cursor:not-allowed">&laquo; Prev</span>'
-    
-    pagination_block += f"""<form action="" method="get" style="display:flex;align-items:center;gap:10px;margin:0"><label style="margin:0;color:var(--text-muted)">Page</label><select name="page" onchange="this.form.submit()" style="padding:8px;border-radius:6px;background:var(--bg);color:var(--text);border:1px solid #4b5563;cursor:pointer;min-width:80px">"""
-    for p in range(1, total_pages + 1):
-        sel = 'selected' if p == page else ''
-        pagination_block += f'<option value="{p}" {sel}>{p}</option>'
-    pagination_block += f"""</select><span style="color:var(--text-muted)">of {total_pages}</span></form>"""
-    
-    if page < total_pages: pagination_block += f'<a href="?page={page+1}" class="page-btn">Next &raquo;</a>'
-    else: pagination_block += '<span class="page-btn" style="opacity:0.5;cursor:not-allowed">Next &raquo;</span>'
-    pagination_block += "</div></div>"
-
-    content = pagination_block
-    if todo_items:
-        content += f"""<div class="section-header"><h2>Missing Posters</h2><span>{len(todo_items)} on page</span></div><div class="grid">"""
-        for i in todo_items: content += f"""<a href="/item/{i['ratingKey']}" class="card"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{safe_html(i['title'])}</div></a>"""
-        content += "</div>"
-    if partial_items:
-        content += f"""<div class="section-header"><h2 style="color:var(--warning)">Half Missing</h2><span>{len(partial_items)} on page</span></div><div class="grid">"""
-        for i in partial_items: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="border:2px solid var(--warning)"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">⚠️ {safe_html(i['title'])}</div></a>"""
-        content += "</div>"
-    if done_items_list:
-        content += f"""<div class="section-header"><h2 style="color:var(--accent)">Already Downloaded</h2><span>{len(done_items_list)} total</span></div><div class="grid">"""
-        for i in done_items_list: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="opacity:0.7"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">✅ {safe_html(i['title'])}</div></a>"""
-        content += "</div>"
-    if not todo_items and not partial_items and not done_items_list: content += "<p>No items found.</p>"
-    content += pagination_block
-
-    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), title=lib.title, breadcrumbs=[(lib.title, '#')], toggle_override=False)
+    # Use a pure Jinja2 template so all item data is rendered via {{ }} with
+    # autoescape — no user-derived content is concatenated into the template
+    # string itself (eliminates CodeQL SSTI and XSS findings).
+    LIBRARY_TPL = """
+<div class="pagination" style="margin:30px 0;border-top:1px solid #444;padding-top:20px">
+  <div style="display:flex;align-items:center;justify-content:center;gap:15px">
+    {% if page > 1 %}<a href="?page={{ page - 1 }}" class="page-btn">&laquo; Prev</a>
+    {% else %}<span class="page-btn" style="opacity:0.5;cursor:not-allowed">&laquo; Prev</span>{% endif %}
+    <form action="" method="get" style="display:flex;align-items:center;gap:10px;margin:0">
+      <label style="margin:0;color:var(--text-muted)">Page</label>
+      <select name="page" onchange="this.form.submit()" style="padding:8px;border-radius:6px;background:var(--bg);color:var(--text);border:1px solid #4b5563;cursor:pointer;min-width:80px">
+        {% for p in range(1, total_pages + 1) %}<option value="{{ p }}"{% if p == page %} selected{% endif %}>{{ p }}</option>{% endfor %}
+      </select>
+      <span style="color:var(--text-muted)">of {{ total_pages }}</span>
+    </form>
+    {% if page < total_pages %}<a href="?page={{ page + 1 }}" class="page-btn">Next &raquo;</a>
+    {% else %}<span class="page-btn" style="opacity:0.5;cursor:not-allowed">Next &raquo;</span>{% endif %}
+  </div>
+</div>
+{% if todo_items %}
+<div class="section-header"><h2>Missing Posters</h2><span>{{ todo_items|length }} on page</span></div>
+<div class="grid">{% for i in todo_items %}<a href="/item/{{ i.ratingKey }}" class="card"><img src="{{ i.thumbUrl }}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{{ i.title }}</div></a>{% endfor %}</div>
+{% endif %}
+{% if partial_items %}
+<div class="section-header"><h2 style="color:var(--warning)">Half Missing</h2><span>{{ partial_items|length }} on page</span></div>
+<div class="grid">{% for i in partial_items %}<a href="/item/{{ i.ratingKey }}" class="card" style="border:2px solid var(--warning)"><img src="{{ i.thumbUrl }}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{{ i.title }}</div></a>{% endfor %}</div>
+{% endif %}
+{% if done_items_list %}
+<div class="section-header"><h2 style="color:var(--accent)">Already Downloaded</h2><span>{{ done_items_list|length }} total</span></div>
+<div class="grid">{% for i in done_items_list %}<a href="/item/{{ i.ratingKey }}" class="card" style="opacity:0.7"><img src="{{ i.thumbUrl }}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{{ i.title }}</div></a>{% endfor %}</div>
+{% endif %}
+{% if not todo_items and not partial_items and not done_items_list %}<p>No items found.</p>{% endif %}
+<div class="pagination" style="margin:30px 0;border-top:1px solid #444;padding-top:20px">
+  <div style="display:flex;align-items:center;justify-content:center;gap:15px">
+    {% if page > 1 %}<a href="?page={{ page - 1 }}" class="page-btn">&laquo; Prev</a>
+    {% else %}<span class="page-btn" style="opacity:0.5;cursor:not-allowed">&laquo; Prev</span>{% endif %}
+    <form action="" method="get" style="display:flex;align-items:center;gap:10px;margin:0">
+      <label style="margin:0;color:var(--text-muted)">Page</label>
+      <select name="page" onchange="this.form.submit()" style="padding:8px;border-radius:6px;background:var(--bg);color:var(--text);border:1px solid #4b5563;cursor:pointer;min-width:80px">
+        {% for p in range(1, total_pages + 1) %}<option value="{{ p }}"{% if p == page %} selected{% endif %}>{{ p }}</option>{% endfor %}
+      </select>
+      <span style="color:var(--text-muted)">of {{ total_pages }}</span>
+    </form>
+    {% if page < total_pages %}<a href="?page={{ page + 1 }}" class="page-btn">Next &raquo;</a>
+    {% else %}<span class="page-btn" style="opacity:0.5;cursor:not-allowed">Next &raquo;</span>{% endif %}
+  </div>
+</div>
+"""
+    return render_template_string(HTML_TOP + LIBRARY_TPL + HTML_BOTTOM,
+                                  title=lib.title, breadcrumbs=[(lib.title, '#')],
+                                  toggle_override=False,
+                                  todo_items=todo_items, partial_items=partial_items,
+                                  done_items_list=done_items_list,
+                                  page=page, total_pages=total_pages)
 
 @app.route('/item/<rating_key>')
 def view_item(rating_key):
@@ -1380,7 +1402,7 @@ def view_item(rating_key):
     </div>
 
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
-    for i, p in enumerate(posters):
+    for p in posters:
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
@@ -1391,7 +1413,7 @@ def view_item(rating_key):
                 <img src="{safe_html(p_url)}" loading="lazy">
                 <div class="provider-badge">{safe_html(format_provider(p.provider))}</div>
             </div>
-            <input type="hidden" name="img_index" value="{i}">
+            <input type="hidden" name="poster_key" value="{safe_html(getattr(p, 'key', ''))}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
@@ -1399,7 +1421,7 @@ def view_item(rating_key):
     content += "</div></div>"
 
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
-    for i, bg in enumerate(backgrounds):
+    for bg in backgrounds:
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
@@ -1410,7 +1432,7 @@ def view_item(rating_key):
                 <img src="{safe_html(b_url)}" loading="lazy">
                 <div class="provider-badge">{safe_html(format_provider(bg.provider))}</div>
             </div>
-            <input type="hidden" name="img_index" value="{i}">
+            <input type="hidden" name="poster_key" value="{safe_html(getattr(bg, 'key', ''))}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
@@ -1453,14 +1475,14 @@ def view_season(rating_key):
     <div class="tabs"><button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button><button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button></div>
 
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
-    for i, p in enumerate(posters):
+    for p in posters:
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
         content += f"""
         <form action="/download" method="post" class="poster-card {sel_class}">
             <div class="img-container">{badge}<img src="{safe_html(p_url)}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(p.provider))}</div></div>
-            <input type="hidden" name="img_index" value="{i}">
+            <input type="hidden" name="poster_key" value="{safe_html(getattr(p, 'key', ''))}">
             <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
@@ -1468,14 +1490,14 @@ def view_season(rating_key):
     content += "</div></div>"
 
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
-    for i, bg in enumerate(backgrounds):
+    for bg in backgrounds:
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
         content += f"""
         <form action="/download" method="post" class="background-card {sel_class}">
             <div class="img-container">{badge}<img src="{safe_html(b_url)}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(bg.provider))}</div></div>
-            <input type="hidden" name="img_index" value="{i}">
+            <input type="hidden" name="poster_key" value="{safe_html(getattr(bg, 'key', ''))}">
             <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
@@ -1487,25 +1509,24 @@ def view_season(rating_key):
 @app.route('/download', methods=['POST'])
 def download():
     if not plex: return redirect(url_for('settings'))
-    rating_key = request.form.get('rating_key')
-    img_type   = request.form.get('img_type', 'poster')
-    img_index_str = request.form.get('img_index', '')
-    try:
-        img_index = int(img_index_str)
-        if img_index < 0:
-            raise ValueError
-    except (ValueError, TypeError):
-        flash("Invalid poster index.")
+    rating_key   = request.form.get('rating_key')
+    img_type     = request.form.get('img_type', 'poster')
+    poster_key   = request.form.get('poster_key', '')
+    if not poster_key:
+        flash("Missing poster key.")
         return safe_referrer_redirect()
     try:
         item = plex.fetchItem(int(rating_key))
-        # Reconstruct the image URL entirely from the Plex API so no
-        # user-supplied URL ever reaches requests.get() (eliminates SSRF).
+        # Whitelist approach: fetch sources from the Plex API and find the one
+        # whose key matches the submitted value.  img_url is derived from the
+        # matched Plex API object (not from user input), breaking the SSRF
+        # taint chain that CodeQL would otherwise flag.
         sources = item.posters() if img_type == 'poster' else item.arts()
-        if img_index >= len(sources):
-            flash("Poster index out of range.")
+        matched = next((s for s in sources if getattr(s, 'key', None) == poster_key), None)
+        if matched is None:
+            flash("Poster not found.")
             return safe_referrer_redirect()
-        img_url = get_poster_url(sources[img_index])
+        img_url = get_poster_url(matched)
         if not img_url or not validate_image_url(img_url):
             flash("Blocked: image URL failed security validation.")
             return safe_referrer_redirect()
