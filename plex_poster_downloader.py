@@ -12,6 +12,7 @@ import datetime
 import ipaddress
 import socket
 from urllib.parse import urlparse
+from markupsafe import escape, Markup
 # Try to import ZoneInfo for timezone support (Python 3.9+)
 try:
     from zoneinfo import ZoneInfo
@@ -247,6 +248,18 @@ def check_file_exists(item, lib_title=None, img_type='poster'):
     if target_path:
         return os.path.exists(target_path)
     return False
+
+def safe_html(value):
+    """Escape a value for safe interpolation into HTML strings rendered via
+    render_template_string.  Prevents both XSS (HTML special chars) and SSTI
+    (Jinja2 delimiter injection) by escaping HTML entities and then replacing
+    any remaining { / } characters so Jinja2 never sees them as template tags.
+    Returns a Markup object so the value won't be double-escaped if Jinja2
+    also processes the surrounding template.
+    """
+    text = str(escape(value))                        # HTML-escape < > & " '
+    text = text.replace('{', '&#123;').replace('}', '&#125;')  # kill {{ }}
+    return Markup(text)
 
 def safe_referrer_redirect(fallback='home'):
     """Redirect to request.referrer only when it points to the same host.
@@ -1306,15 +1319,15 @@ def view_library(lib_id):
     content = pagination_block
     if todo_items:
         content += f"""<div class="section-header"><h2>Missing Posters</h2><span>{len(todo_items)} on page</span></div><div class="grid">"""
-        for i in todo_items: content += f"""<a href="/item/{i['ratingKey']}" class="card"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{i['title']}</div></a>"""
+        for i in todo_items: content += f"""<a href="/item/{i['ratingKey']}" class="card"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">{safe_html(i['title'])}</div></a>"""
         content += "</div>"
     if partial_items:
         content += f"""<div class="section-header"><h2 style="color:var(--warning)">Half Missing</h2><span>{len(partial_items)} on page</span></div><div class="grid">"""
-        for i in partial_items: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="border:2px solid var(--warning)"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">⚠️ {i['title']}</div></a>"""
+        for i in partial_items: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="border:2px solid var(--warning)"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">⚠️ {safe_html(i['title'])}</div></a>"""
         content += "</div>"
     if done_items_list:
         content += f"""<div class="section-header"><h2 style="color:var(--accent)">Already Downloaded</h2><span>{len(done_items_list)} total</span></div><div class="grid">"""
-        for i in done_items_list: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="opacity:0.7"><img src="{i['thumbUrl']}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">✅ {i['title']}</div></a>"""
+        for i in done_items_list: content += f"""<a href="/item/{i['ratingKey']}" class="card" style="opacity:0.7"><img src="{safe_html(i['thumbUrl'])}" loading="lazy" onerror="this.src='https://via.placeholder.com/200x300?text=No+Img'"><div class="title">✅ {safe_html(i['title'])}</div></a>"""
         content += "</div>"
     if not todo_items and not partial_items and not done_items_list: content += "<p>No items found.</p>"
     content += pagination_block
@@ -1348,55 +1361,57 @@ def view_item(rating_key):
     rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
 
     content = f"""
-    <div class="path-info">Target Folder: <strong>.../{rel_path}/</strong></div>
+    <div class="path-info">Target Folder: <strong>.../{safe_html(rel_path)}/</strong></div>
     <div class="tabs">
         <button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button>
         <button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button>
     </div>
-    
+
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
     for p in posters:
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_p_url = safe_html(p_url)
         content += f"""
         <form action="/download" method="post" class="poster-card {sel_class}">
             <div class="img-container">
                 {badge}
-                <img src="{p_url}" loading="lazy">
-                <div class="provider-badge">{format_provider(p.provider)}</div>
+                <img src="{safe_p_url}" loading="lazy">
+                <div class="provider-badge">{safe_html(format_provider(p.provider))}</div>
             </div>
-            <input type="hidden" name="img_url" value="{p_url}">
+            <input type="hidden" name="img_url" value="{safe_p_url}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
         </form>"""
     content += "</div></div>"
-    
+
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
     for bg in backgrounds:
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_b_url = safe_html(b_url)
         content += f"""
         <form action="/download" method="post" class="background-card {sel_class}">
             <div class="img-container">
                 {badge}
-                <img src="{b_url}" loading="lazy">
-                <div class="provider-badge">{format_provider(bg.provider)}</div>
+                <img src="{safe_b_url}" loading="lazy">
+                <div class="provider-badge">{safe_html(format_provider(bg.provider))}</div>
             </div>
-            <input type="hidden" name="img_url" value="{b_url}">
+            <input type="hidden" name="img_url" value="{safe_b_url}">
             <input type="hidden" name="rating_key" value="{item.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
         </form>"""
     content += "</div></div>"
-    
+
     if is_show:
         content += f"""<div class="section-header"><h2>Seasons</h2></div><div class="grid">"""
         for s in seasons:
             thumb = s.thumbUrl if s.thumb else ''
-            content += f"""<a href="/season/{s.ratingKey}" class="card"><img src="{thumb}" loading="lazy"><div class="title">{s.title}</div></a>"""
+            content += f"""<a href="/season/{s.ratingKey}" class="card"><img src="{safe_html(thumb)}" loading="lazy"><div class="title">{safe_html(s.title)}</div></a>"""
         content += "</div>"
         
     return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=item.title, breadcrumbs=[(lib.title, f'/library/{lib.key}'), (item.title, '#')], 
@@ -1424,34 +1439,36 @@ def view_season(rating_key):
     rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
     
     content = f"""
-    <div class="path-info">Target: <strong>.../{rel_path}/</strong></div>
+    <div class="path-info">Target: <strong>.../{safe_html(rel_path)}/</strong></div>
     <div class="tabs"><button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button><button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button></div>
-    
+
     <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
     for p in posters:
         p_url = get_poster_url(p)
         sel_class = 'selected' if p_url == sel_poster else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_p_url = safe_html(p_url)
         content += f"""
         <form action="/download" method="post" class="poster-card {sel_class}">
-            <div class="img-container">{badge}<img src="{p_url}" loading="lazy"><div class="provider-badge">{format_provider(p.provider)}</div></div>
-            <input type="hidden" name="img_url" value="{{ p_url }}">
-            <input type="hidden" name="rating_key" value="{{ season.ratingKey }}">
+            <div class="img-container">{badge}<img src="{safe_p_url}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(p.provider))}</div></div>
+            <input type="hidden" name="img_url" value="{safe_p_url}">
+            <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="poster">
             <button type="submit" class="btn">Download</button>
         </form>"""
     content += "</div></div>"
-    
+
     content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
     for bg in backgrounds:
         b_url = get_poster_url(bg)
         sel_class = 'selected' if b_url == sel_bg else ''
         badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
+        safe_b_url = safe_html(b_url)
         content += f"""
         <form action="/download" method="post" class="background-card {sel_class}">
-            <div class="img-container">{badge}<img src="{b_url}" loading="lazy"><div class="provider-badge">{format_provider(bg.provider)}</div></div>
-            <input type="hidden" name="img_url" value="{{ b_url }}">
-            <input type="hidden" name="rating_key" value="{{ season.ratingKey }}">
+            <div class="img-container">{badge}<img src="{safe_b_url}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(bg.provider))}</div></div>
+            <input type="hidden" name="img_url" value="{safe_b_url}">
+            <input type="hidden" name="rating_key" value="{season.ratingKey}">
             <input type="hidden" name="img_type" value="background">
             <button type="submit" class="btn">Download</button>
         </form>"""
@@ -1495,4 +1512,7 @@ def toggle_complete():
 if __name__ == '__main__':
     if not os.path.exists(CONFIG_FILE): save_config(DEFAULT_CONFIG)
     if not os.path.exists(DEFAULT_CONFIG['DOWNLOAD_BASE_DIR']): os.makedirs(DEFAULT_CONFIG['DOWNLOAD_BASE_DIR'])
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    _host  = os.environ.get('FLASK_RUN_HOST', '0.0.0.0')
+    _port  = int(os.environ.get('FLASK_RUN_PORT', '5000'))
+    _debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(host=_host, port=_port, debug=_debug)
