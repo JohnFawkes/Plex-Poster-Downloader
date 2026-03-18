@@ -12,7 +12,7 @@ RUN pip install --upgrade pip
 # address CVEs flagged by Trivy (privilege escalation and path-traversal).
 # They are installed before Flask/PlexAPI so pip resolves their transitive
 # dependency slots to the newer, patched versions.
-RUN pip install --no-cache-dir --upgrade wheel "jaraco.context>=6.0.0" \
+RUN pip install --no-cache-dir "wheel>=0.46.2" "jaraco.context>=6.1.0" \
     && pip install --no-cache-dir Flask PlexAPI requests cryptography
 
 # Copy the script into the container
