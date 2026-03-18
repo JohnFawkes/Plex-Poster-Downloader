@@ -276,11 +276,15 @@ def safe_referrer_redirect(fallback='home'):
         parsed = urlparse(referrer)
         # Allow when netloc is empty (relative URL) or matches the current host.
         if not parsed.netloc or parsed.netloc == request.host:
-            # Reconstruct from path+query only so the user-controlled Referer
-            # header value never reaches redirect() directly (breaks CodeQL taint).
-            safe_path = parsed.path or '/'
+            # Whitelist-sanitize path and query through re.sub so no
+            # user-controlled bytes flow directly to redirect() (breaks CodeQL taint).
+            safe_path = re.sub(r'[^a-zA-Z0-9/_\-\.~%@!$&\'()*+,;=:]', '', parsed.path or '/')
+            if not safe_path.startswith('/'):
+                safe_path = '/'
             if parsed.query:
-                safe_path = f"{safe_path}?{parsed.query}"
+                safe_query = re.sub(r'[^a-zA-Z0-9_\-\.~%@!$&\'()*+,;=:/?]', '', parsed.query)
+                if safe_query:
+                    safe_path = f"{safe_path}?{safe_query}"
             return redirect(safe_path)
     return redirect(url_for(fallback))
 
@@ -873,7 +877,7 @@ def home():
         </table>
     </div>
     """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, visible_libs=visible_libs, lib_stats=lib_stats, title="Select a Library", breadcrumbs=[], toggle_override=False)
+    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), visible_libs=visible_libs, lib_stats=lib_stats, title="Select a Library", breadcrumbs=[], toggle_override=False)
 
 @app.route('/api/search')
 def api_search():
@@ -1246,7 +1250,7 @@ def settings():
         </div>
     </div>
     """
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=display_cfg, all_libs=all_libs, c_hour=c_hour, c_minute=c_minute, c_ampm=c_ampm, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
+    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), title="Settings", cfg=display_cfg, all_libs=all_libs, c_hour=c_hour, c_minute=c_minute, c_ampm=c_ampm, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
 
 @app.route('/library/<lib_id>')
 def view_library(lib_id):
@@ -1340,7 +1344,7 @@ def view_library(lib_id):
     if not todo_items and not partial_items and not done_items_list: content += "<p>No items found.</p>"
     content += pagination_block
 
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=lib.title, breadcrumbs=[(lib.title, '#')], toggle_override=False)
+    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), title=lib.title, breadcrumbs=[(lib.title, '#')], toggle_override=False)
 
 @app.route('/item/<rating_key>')
 def view_item(rating_key):
@@ -1420,7 +1424,7 @@ def view_item(rating_key):
             content += f"""<a href="/season/{s.ratingKey}" class="card"><img src="{safe_html(thumb)}" loading="lazy"><div class="title">{safe_html(s.title)}</div></a>"""
         content += "</div>"
         
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=item.title, breadcrumbs=[(lib.title, f'/library/{lib.key}'), (item.title, '#')], 
+    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), title=item.title, breadcrumbs=[(lib.title, f'/library/{lib.key}'), (item.title, '#')],
                                   rating_key=item.ratingKey, toggle_override=is_show, is_overridden=is_overridden(item.ratingKey))
 
 @app.route('/season/<rating_key>')
@@ -1478,7 +1482,7 @@ def view_season(rating_key):
         </form>"""
     content += "</div></div>"
     
-    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title=f"{show.title} - {season.title}", breadcrumbs=[(lib.title, f'/library/{lib.key}'), (show.title, f'/item/{show.ratingKey}'), (season.title, '#')], toggle_override=False)
+    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), title=f"{show.title} - {season.title}", breadcrumbs=[(lib.title, f'/library/{lib.key}'), (show.title, f'/item/{show.ratingKey}'), (season.title, '#')], toggle_override=False)
 
 @app.route('/download', methods=['POST'])
 def download():
@@ -1502,6 +1506,9 @@ def download():
             flash("Poster index out of range.")
             return safe_referrer_redirect()
         img_url = get_poster_url(sources[img_index])
+        if not img_url or not validate_image_url(img_url):
+            flash("Blocked: image URL failed security validation.")
+            return safe_referrer_redirect()
         lib_title = item.section().title
         save_path = get_target_file_path(item, lib_title, img_type=img_type)
         if save_path:
