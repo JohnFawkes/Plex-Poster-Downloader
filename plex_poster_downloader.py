@@ -248,6 +248,21 @@ def check_file_exists(item, lib_title=None, img_type='poster'):
         return os.path.exists(target_path)
     return False
 
+def safe_referrer_redirect(fallback='home'):
+    """Redirect to request.referrer only when it points to the same host.
+
+    Prevents open-redirect attacks where an attacker sets the Referer header
+    to an external URL and tricks the server into redirecting victims there.
+    Falls back to url_for(fallback) when the referrer is absent or external.
+    """
+    referrer = request.referrer
+    if referrer:
+        parsed = urlparse(referrer)
+        # Allow when netloc is empty (relative URL) or matches the current host.
+        if not parsed.netloc or parsed.netloc == request.host:
+            return redirect(referrer)
+    return redirect(url_for(fallback))
+
 def validate_image_url(url):
     """Validate a URL to prevent SSRF attacks.
 
@@ -1452,7 +1467,7 @@ def download():
     img_type = request.form.get('img_type', 'poster')
     if not img_url or not validate_image_url(img_url):
         flash("Invalid or disallowed image URL.")
-        return redirect(request.referrer)
+        return safe_referrer_redirect()
     try:
         item = plex.fetchItem(int(rating_key))
         lib_title = item.section().title
@@ -1467,7 +1482,7 @@ def download():
                 flash(f"Saved {img_type}!")
             else: flash("Download failed.")
     except Exception as e: flash(f"Error: {e}")
-    return redirect(request.referrer)
+    return safe_referrer_redirect()
 
 @app.route('/toggle_complete', methods=['POST'])
 def toggle_complete():
@@ -1475,7 +1490,7 @@ def toggle_complete():
     if rating_key:
         toggle_override_status(rating_key)
         flash("Status toggled.")
-    return redirect(request.referrer)
+    return safe_referrer_redirect()
 
 if __name__ == '__main__':
     if not os.path.exists(CONFIG_FILE): save_config(DEFAULT_CONFIG)
