@@ -19,7 +19,8 @@ ENV FLASK_RUN_HOST=0.0.0.0
 ENV FLASK_DEBUG=0
 
 # Run as a non-root user to limit the blast radius if the app is compromised
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser \
+    && chown -R appuser:appgroup /app
 USER appuser
 
 # Expose the Flask port
