@@ -189,20 +189,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Security scan: build image locally so Trivy can inspect it without
-      # requiring a registry pull (works for both PRs and push events).
-      - name: Build image locally for Trivy scan
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          load: true
-          tags: scan-target:latest
-          cache-from: type=gha
-
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: 'scan-target:latest'
+          scan-type: 'fs'
+          scan-ref: '.'
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
