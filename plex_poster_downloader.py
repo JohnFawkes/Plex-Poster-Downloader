@@ -490,7 +490,10 @@ def run_cron_job():
                                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                                 key = selected_img.key
                                 url = key if key.startswith('http') else plex.url(key)
-                                
+
+                                if not validate_image_url(url):
+                                    log_verbose(f"Cron: Skipping {item.title} — URL failed SSRF validation: {url}")
+                                    continue
                                 log_verbose(f"Cron: Downloading {img_type} for {item.title} (Provider: {selected_img.provider})")
                                 r = requests.get(url, stream=True)
                                 if r.status_code == 200:
