@@ -106,6 +106,8 @@ services:
       - ./downloaded_posters:/app/downloaded_posters
     environment:
       - DATA_DIR=/app/config
+      - PUID=1000  # run `id -u` on your host to get your UID
+      - PGID=1000  # run `id -g` on your host to get your GID
 ```
 
 **3. Run the Container**
