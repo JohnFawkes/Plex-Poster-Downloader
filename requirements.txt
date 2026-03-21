@@ -1,3 +1,4 @@
 Flask
 PlexAPI
 requests
+python-dotenv
