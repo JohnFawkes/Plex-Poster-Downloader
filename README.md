@@ -83,40 +83,40 @@ The easiest way to run this application is using Docker.
 
   * **Docker Compose**
 
-**1. Create a project directory**
+**1. Create Project Directory**
 
-Create a folder on your server and download `compose.yaml` and `.env.example` into it.
+Create a folder on your server and place the ``compose.yaml`` file inside it.
 
-**2. Create your `.env` file**
+**2. Configure Volumes**
 
-Copy the example file and fill in at minimum your Plex URL and token:
-
-```
-cp .env.example .env
-```
-
-Then open `.env` and set:
+Open ``compose.yaml`` and ensure the volumes map to your actual media folders.
 
 ```
-PLEX_URL=http://192.168.1.100:32400
-PLEX_TOKEN=your-plex-token-here
+services:
+  plex-poster-downloader:
+    image: ghcr.io/johnfawkes/plex-poster-downloader:latest
+    container_name: plex-poster-manager
+    restart: unless-stopped
+    ports:
+      - "5015:5000"
+    volumes:
+      # Stores config.json and download history
+      - ./config:/app/config
+      # If using with Kometa, change the first downloaded_posters to the asset directory for kometa
+      - ./downloaded_posters:/app/downloaded_posters
+    environment:
+      - DATA_DIR=/app/config
 ```
 
-All other settings have sensible defaults. See `.env.example` for the full list of options — everything configurable in the WebUI can also be set here.
-
-**3. Run the container**
+**3. Run the Container**
 
 ```
-docker compose up -d
+docker-compose up -d
 ```
 
 **4. Access the UI**
 
-Open your browser and navigate to: ``http://localhost:5000``
-
-On first launch you will be prompted to create an admin username and password.
-
-> **Tip — Kometa users:** Set `DOWNLOAD_BASE_DIR` in your `.env` to point at the Kometa asset directory so posters land exactly where Kometa expects them.
+Open your browser and navigate to: ``http://localhost:5015``
 
 ## 🐍 **Manual Installation (Python)**
 
@@ -151,35 +151,11 @@ pip install -r requirements.txt
 python plex_poster_downloader.py
 ```
 
-  4. **Access the UI** Open ``http://localhost:5000`` in your browser.
+  4. **Access the UI** Open ``http://localhost:5015`` in your browser.
 
 ## **⚙️ Configuration**
 
-There are two ways to configure the app — use whichever suits your workflow:
-
-**Option A — `.env` file (recommended for new installs)**
-
-Set your values in `.env` before starting the container. Environment variables always take precedence over `config.json`, so the app is ready to go with no WebUI interaction needed.
-
-| Variable | Description | Default |
-|---|---|---|
-| `PLEX_URL` | Base URL of your Plex server | `http://127.0.0.1:32400` |
-| `PLEX_TOKEN` | Your X-Plex-Token ([how to find it](https://support.plex.tv/articles/204059436)) | — |
-| `DOWNLOAD_BASE_DIR` | Where posters are saved | `/app/downloaded_posters` |
-| `ASSET_STYLE` | `ASSET_FOLDERS` or `PLEX_FOLDERS` | `ASSET_FOLDERS` |
-| `AUTH_DISABLED` | `true` to skip login (trusted networks only) | `false` |
-| `CRON_ENABLED` | Enable scheduled downloads | `false` |
-| `CRON_TIME` | Schedule time (24 h `HH:MM`) | `03:00` |
-| `CRON_DAY` | `DAILY` or a weekday name | `DAILY` |
-| `CRON_TZ` | Timezone (e.g. `America/New_York`) | `Local` |
-| `CRON_PROVIDER` | Preferred provider (`tmdb`, `tvdb`, …) | `tmdb` |
-| `IGNORED_LIBRARIES` | Comma-separated library names to skip | — |
-
-See `.env.example` for the full list with descriptions.
-
-**Option B — WebUI Settings page**
-
-On first launch you will be redirected to the Settings page.
+On the first launch, you will be redirected to the Settings page.
 
   1. **Authentication:** You will be asked to create an Admin Username and Password.
 
