@@ -15,7 +15,7 @@ on:
       - 'plex_poster_downloader.py'
       - 'Dockerfile'
       - 'requirements.txt'
-
+  workflow_dispatch:
 env:
   REGISTRY: ghcr.io
 
