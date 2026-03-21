@@ -98,7 +98,7 @@ services:
     container_name: plex-poster-manager
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5015:5000"
     volumes:
       # Stores config.json and download history
       - ./config:/app/config
@@ -116,7 +116,7 @@ docker-compose up -d
 
 **4. Access the UI**
 
-Open your browser and navigate to: ``http://localhost:5000``
+Open your browser and navigate to: ``http://localhost:5015``
 
 ## 🐍 **Manual Installation (Python)**
 
@@ -151,7 +151,7 @@ pip install -r requirements.txt
 python plex_poster_downloader.py
 ```
 
-  4. **Access the UI** Open ``http://localhost:5000`` in your browser.
+  4. **Access the UI** Open ``http://localhost:5015`` in your browser.
 
 ## **⚙️ Configuration**
 
