@@ -1,10 +1,15 @@
 #!/bin/sh
 set -e
 
-# Ensure the config directory exists and is writable by appuser before
-# dropping privileges. This is needed when /app/config is a bind-mount
-# created by root on the host.
+PUID=${PUID:-1000}
+PGID=${PGID:-1000}
+
+# Remap appuser/appgroup to match the host user's UID/GID so that the
+# bind-mounted /app/config directory is writable without changing its
+# ownership on the host.
+groupmod -o -g "$PGID" appgroup
+usermod  -o -u "$PUID" appuser
+
 mkdir -p /app/config
-chown -R appuser:appgroup /app/config
 
 exec gosu appuser "$@"
