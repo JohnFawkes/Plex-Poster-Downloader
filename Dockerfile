@@ -13,7 +13,7 @@ RUN pip install --upgrade pip
 # They are installed before Flask/PlexAPI so pip resolves their transitive
 # dependency slots to the newer, patched versions.
 RUN pip install --no-cache-dir "wheel>=0.46.2" "jaraco.context>=6.1.0" \
-    && pip install --no-cache-dir Flask PlexAPI requests cryptography
+    && pip install --no-cache-dir Flask PlexAPI requests cryptography python-dotenv
 
 # Copy the script into the container
 COPY plex_poster_downloader.py .
