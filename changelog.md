@@ -2,30 +2,6 @@
 
 All notable changes to the Plex Poster Downloader project will be documented in this file.
 
-## [v0.7.4] - .env Configuration & Security Hardening
-
-## Added
-
-* **.env support:** Copy `.env.example` to `.env`, set `PLEX_URL` and `PLEX_TOKEN`, and the app is ready with no WebUI setup required. Every setting available in the WebUI can now be pre-seeded from the environment file, with env vars always taking precedence over `config.json`.
-
-* **`.env.example`:** Fully documented template covering all runtime, connection, download, cron, and logging variables with defaults and inline comments.
-
-* **`python-dotenv` dependency:** `.env` is loaded automatically when running outside Docker so the same file works for both bare-metal and containerised deployments.
-
-## Changed
-
-* **`compose.yaml`:** Switched from a hardcoded `environment:` block to `env_file: .env`. Port mapping now honours `${FLASK_RUN_PORT:-5000}`.
-
-* **`.gitignore`:** Added `.env` so credentials are never accidentally committed.
-
-## Security
-
-* **SSTI / Reflected XSS (CodeQL):** Library view converted to a pure Jinja2 template — item data (`title`, `thumbUrl`, etc.) is passed as template variables and rendered with autoescape. No user-derived content is concatenated into the template string.
-
-* **Full SSRF (CodeQL):** Download forms now submit the Plex API poster key instead of a numeric index. The download route resolves the URL from the matched Plex API object, so no user-supplied data reaches `requests.get()` directly.
-
-* **URL Redirection from Remote Source (CodeQL):** `safe_referrer_redirect()` now uses a whitelist of known routes and generates all redirect URLs via `url_for()`. No user-supplied bytes from `request.referrer` ever reach `flask.redirect()` directly.
-
 ## [v0.7.3] - Timezones & Scheduling UX
 
 ## Added

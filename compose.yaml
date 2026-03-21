@@ -3,14 +3,15 @@ services:
     image: ghcr.io/johnfawkes/plex-poster-downloader:latest
     container_name: plex-poster-downloader
     restart: unless-stopped
-    # All configuration lives in .env (copy .env.example → .env to get started).
-    env_file:
-      - path: .env
-        required: false
     ports:
-      - "${FLASK_RUN_PORT:-5000}:5000"
+      - "5000:5000"
     volumes:
       # Persist configuration and history
       - ./config:/app/config
-      # If using with Kometa, change the left-hand path to the Kometa asset directory
+      # If using with Kometa, change the first downloaded_posters to the asset directory for kometa
       - ./downloaded_posters:/app/downloaded_posters
+    environment:
+      # Tell the app where to look for data (matches the volume above)
+      - DATA_DIR=/app/config
+      # Identify the device connecting to plex
+      - PLEXAPI_HEADER_IDENTIFIER=plex-poster-downloader

@@ -13,14 +13,6 @@ import ipaddress
 import socket
 from urllib.parse import urlparse
 from markupsafe import escape, Markup
-# Load .env file before anything else so all os.environ.get() calls below
-# see the values.  This is a no-op when running inside Docker (Docker Compose
-# injects the variables directly from the env_file directive).
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv not installed — rely on the shell environment
 # Try to import ZoneInfo for timezone support (Python 3.9+)
 try:
     from zoneinfo import ZoneInfo
@@ -89,33 +81,21 @@ def decrypt_val(token):
         return token
 
 def get_config():
-    cfg = DEFAULT_CONFIG.copy()
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                stored = json.load(f)
-                for key in DEFAULT_CONFIG:
-                    if key in stored:
-                        cfg[key] = stored[key]
-                if cfg['PLEX_TOKEN']:
-                    cfg['PLEX_TOKEN'] = decrypt_val(cfg['PLEX_TOKEN'])
-        except Exception:
-            pass
-
-    # Environment variables override config.json so users can configure the
-    # app entirely from a .env file without touching the WebUI.
-    _BOOL_KEYS = {'AUTH_DISABLED', 'CRON_ENABLED', 'CRON_DOWNLOAD_BACKGROUNDS', 'VERBOSE_LOGGING'}
-    _LIST_KEYS = {'IGNORED_LIBRARIES', 'CRON_LIBRARIES'}
-    for key in DEFAULT_CONFIG:
-        env_val = os.environ.get(key)
-        if env_val is not None:
-            if key in _BOOL_KEYS:
-                cfg[key] = env_val.lower() in ('1', 'true', 'yes')
-            elif key in _LIST_KEYS:
-                cfg[key] = [v.strip() for v in env_val.split(',') if v.strip()]
-            else:
-                cfg[key] = env_val
-    return cfg
+    if not os.path.exists(CONFIG_FILE):
+        return DEFAULT_CONFIG
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            cfg = json.load(f)
+            for key, val in DEFAULT_CONFIG.items():
+                if key not in cfg:
+                    cfg[key] = val
+            
+            if cfg['PLEX_TOKEN']:
+                cfg['PLEX_TOKEN'] = decrypt_val(cfg['PLEX_TOKEN'])
+                
+            return cfg
+    except:
+        return DEFAULT_CONFIG
 
 def save_config(new_config):
     cfg_to_save = new_config.copy()
