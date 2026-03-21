@@ -28,6 +28,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Debug mode is off by default; set FLASK_DEBUG=1 only in development.
 ENV FLASK_RUN_HOST=0.0.0.0
 ENV FLASK_DEBUG=0
+ENV DATA_DIR=/app/config
 
 # Run as a non-root user to limit the blast radius if the app is compromised.
 # The entrypoint runs as root only long enough to fix /app/config permissions,

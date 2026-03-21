@@ -4,16 +4,9 @@ set -e
 PUID=${PUID:-1000}
 PGID=${PGID:-1000}
 
-# Remap appuser/appgroup to match the host user's UID/GID so that the
-# bind-mounted /app/config directory is writable without changing its
-# ownership on the host.
-groupmod -o -g "$PGID" appgroup
-usermod  -o -u "$PUID" appuser
-
+# gosu supports numeric uid:gid directly, so no usermod/groupmod needed.
+# Just ensure the config dir exists and is owned by the target user.
 mkdir -p /app/config
-# Ensure the config dir is owned by the target UID/GID.  This is a no-op
-# when the host dir is already owned by that user, but fixes the case
-# where Docker auto-created ./config as root on first run.
 chown "${PUID}:${PGID}" /app/config
 
-exec gosu appuser "$@"
+exec gosu "${PUID}:${PGID}" "$@"
