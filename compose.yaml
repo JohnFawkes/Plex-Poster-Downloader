@@ -7,7 +7,7 @@ services:
     env_file:
       - .env
     ports:
-      - "${FLASK_RUN_PORT:-5000}:${FLASK_RUN_PORT:-5000}"
+      - "${FLASK_RUN_PORT:-5000}:5000"
     volumes:
       # Persist configuration and history
       - ./config:/app/config
