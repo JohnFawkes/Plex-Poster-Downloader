@@ -11,5 +11,9 @@ groupmod -o -g "$PGID" appgroup
 usermod  -o -u "$PUID" appuser
 
 mkdir -p /app/config
+# Ensure the config dir is owned by the target UID/GID.  This is a no-op
+# when the host dir is already owned by that user, but fixes the case
+# where Docker auto-created ./config as root on first run.
+chown "${PUID}:${PGID}" /app/config
 
 exec gosu appuser "$@"
