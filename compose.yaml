@@ -4,7 +4,7 @@ services:
     container_name: plex-poster-downloader
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5015:5000"
     volumes:
       # Persist configuration and history
       - ./config:/app/config
