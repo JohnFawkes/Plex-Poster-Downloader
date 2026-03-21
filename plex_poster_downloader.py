@@ -891,7 +891,7 @@ def home():
         </table>
     </div>
     """
-    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), visible_libs=visible_libs, lib_stats=lib_stats, title="Select a Library", breadcrumbs=[], toggle_override=False)
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, visible_libs=visible_libs, lib_stats=lib_stats, title="Select a Library", breadcrumbs=[], toggle_override=False)
 
 @app.route('/api/search')
 def api_search():
@@ -1264,7 +1264,7 @@ def settings():
         </div>
     </div>
     """
-    return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), title="Settings", cfg=display_cfg, all_libs=all_libs, c_hour=c_hour, c_minute=c_minute, c_ampm=c_ampm, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
+    return render_template_string(HTML_TOP + content + HTML_BOTTOM, title="Settings", cfg=display_cfg, all_libs=all_libs, c_hour=c_hour, c_minute=c_minute, c_ampm=c_ampm, breadcrumbs=[('Settings', '#')], toggle_override=False, is_unconfigured=is_unconfigured, auth_disabled=auth_disabled)
 
 @app.route('/library/<lib_id>')
 def view_library(lib_id):
