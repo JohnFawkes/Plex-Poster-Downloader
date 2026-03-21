@@ -9,7 +9,7 @@ services:
       # Persist configuration and history
       - ./config:/app/config
       # If using with Kometa, change the first downloaded_posters to the asset directory for kometa
-      - ./downloaded_posters:/app/downloaded_posters
+      - ./downloaded_posters:/app/config/downloaded_posters
     environment:
       # Tell the app where to look for data (matches the volume above)
       - DATA_DIR=/app/config

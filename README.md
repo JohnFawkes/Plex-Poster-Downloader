@@ -103,7 +103,7 @@ services:
       # Stores config.json and download history
       - ./config:/app/config
       # If using with Kometa, change the first downloaded_posters to the asset directory for kometa
-      - ./downloaded_posters:/app/downloaded_posters
+      - ./downloaded_posters:/app/config/downloaded_posters
     environment:
       - DATA_DIR=/app/config
       - PUID=1000  # run `id -u` on your host to get your UID
