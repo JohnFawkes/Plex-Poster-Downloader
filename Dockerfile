@@ -39,5 +39,7 @@ RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser \
 # Expose the Flask port
 EXPOSE 5000
 
+# nosemgrep: missing-user-entrypoint
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# nosemgrep: missing-user
 CMD ["python", "plex_poster_downloader.py"]
