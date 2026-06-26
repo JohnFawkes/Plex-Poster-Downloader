@@ -969,7 +969,15 @@ def settings():
         except: pass
     
     if request.method == 'POST':
+        # Require authentication for all POST actions unless the system has no account yet.
+        # create_account is additionally restricted to only work when unconfigured.
+        if not is_unconfigured and not auth_disabled and 'user' not in session:
+            return redirect(url_for('login'))
+
         action = request.form.get('action')
+        if action == 'create_account' and not is_unconfigured:
+            flash("An account already exists. Use change_password to update credentials.")
+            return redirect(url_for('settings'))
         if action == 'update_config':
             cfg['PLEX_URL'] = request.form.get('plex_url', '').strip()
             # Handle Token Update: Only update if not the placeholder
