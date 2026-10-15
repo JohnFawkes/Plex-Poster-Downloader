@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gosu \
     && pip uninstall --yes pip
 
 # Copy the application and entrypoint
-COPY plex_poster_downloader.py .
+COPY plex_poster_downloader.py artwork_common.py artwork_providers.py anime_providers.py ./
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

@@ -2,4 +2,5 @@ Flask
 PlexAPI
 requests
 cryptography
+Pillow
 urllib3>=2.8.0

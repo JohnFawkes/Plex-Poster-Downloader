@@ -11,6 +11,9 @@ import random
 import datetime
 import ipaddress
 import socket
+import hashlib
+import secrets
+from PIL import Image
 from urllib.parse import urlparse
 from markupsafe import escape, Markup
 # Try to import ZoneInfo for timezone support (Python 3.9+)
@@ -23,9 +26,10 @@ except ImportError:
 from datetime import timedelta
 from flask import Flask, render_template_string, request, redirect, flash, url_for, session, jsonify
 from plexapi.server import PlexServer
-from plexapi.exceptions import NotFound, Unauthorized
+from plexapi.exceptions import NotFound, Unauthorized, PlexApiException
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
+from artwork_common import Artwork, ArtworkContext
 
 # ==========================================
 # 1. CONFIGURATION MANAGEMENT
@@ -42,6 +46,17 @@ DEFAULT_CONFIG = {
     'AUTH_DISABLED': False,
     'IGNORED_LIBRARIES': [],
     'ASSET_STYLE': 'ASSET_FOLDERS',
+    'HIDE_UPLOADED_POSTERS': False,
+    'TMDB_API_KEY': '',
+    'TVDB_API_KEY': '',
+    'TVDB_PIN': '',
+    'FANART_API_KEY': '',
+    'MAL_CLIENT_ID': '',
+    'ANIDB_CLIENT': '',
+    'ANIDB_CLIENT_VERSION': '1',
+    'ANIME_LIBRARIES': [],
+    'ANIME_AUTO_MAPPING': True,
+    'ARTWORK_ID_OVERRIDES': {},
     'CRON_ENABLED': False,
     'CRON_TIME': '03:00',
     'CRON_DAY': 'DAILY',
@@ -49,11 +64,16 @@ DEFAULT_CONFIG = {
     'CRON_MODE': 'RANDOM',
     'CRON_PROVIDER': 'tmdb',
     'CRON_DOWNLOAD_BACKGROUNDS': False,
+    'CRON_DOWNLOAD_SEASONS': False,
+    'CRON_DOWNLOAD_TITLECARDS': False,
+    'CRON_DOWNLOAD_CLEARLOGOS': False,
     'VERBOSE_LOGGING': False,
     'CRON_LIBRARIES': []
 }
 
 # --- Encryption Helpers ---
+SECRET_CONFIG_KEYS = ('PLEX_TOKEN', 'TMDB_API_KEY', 'TVDB_API_KEY', 'TVDB_PIN', 'FANART_API_KEY', 'MAL_CLIENT_ID')
+
 def get_encryption_key():
     """Gets or creates a symmetric encryption key."""
     if os.path.exists(KEY_FILE):
@@ -90,8 +110,8 @@ def get_config():
                 if key not in cfg:
                     cfg[key] = val
             
-            if cfg['PLEX_TOKEN']:
-                cfg['PLEX_TOKEN'] = decrypt_val(cfg['PLEX_TOKEN'])
+            for key in SECRET_CONFIG_KEYS:
+                if cfg.get(key): cfg[key] = decrypt_val(cfg[key])
                 
             return cfg
     except:
@@ -99,8 +119,8 @@ def get_config():
 
 def save_config(new_config):
     cfg_to_save = new_config.copy()
-    if cfg_to_save['PLEX_TOKEN']:
-        cfg_to_save['PLEX_TOKEN'] = encrypt_val(cfg_to_save['PLEX_TOKEN'])
+    for key in SECRET_CONFIG_KEYS:
+        if cfg_to_save.get(key): cfg_to_save[key] = encrypt_val(cfg_to_save[key])
 
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg_to_save, f, indent=2)
@@ -170,6 +190,168 @@ def format_provider(provider_str):
     if '.' in p: return p.split('.')[-1].title()
     return p.title()
 
+
+def artwork_badge(artwork):
+    name = format_provider(getattr(artwork, 'provider', None))
+    if getattr(artwork, 'origin', None) == 'direct': return artwork.provider
+    if name == 'Upload': return 'upload_plex'
+    return name.lower() + '_plex'
+
+ARTWORK_ID_FIELDS = ('tmdb', 'tvdb', 'imdb', 'anidb', 'anilist', 'mal')
+_artwork_cache = {}
+_artwork_cache_lock = threading.RLock()
+
+def valid_artwork_id(provider, value):
+    pattern = r'tt\d{7,10}' if provider == 'imdb' else r'[1-9]\d{0,11}'
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
+
+def artwork_context(item, cfg):
+    root = item.show() if item.type in ('season', 'episode') else item
+    ids = {}
+    aliases = {'themoviedb': 'tmdb', 'thetvdb': 'tvdb', 'myanimelist': 'mal'}
+    for guid in list(getattr(root, 'guids', []) or []) + [getattr(root, 'guid', '')]:
+        token = getattr(guid, 'id', guid)
+        if not isinstance(token, str): continue
+        provider, _, value = token.partition('://')
+        provider = aliases.get(provider.rsplit('.', 1)[-1], provider.rsplit('.', 1)[-1])
+        value = value.partition('?')[0]
+        if provider in ARTWORK_ID_FIELDS and valid_artwork_id(provider, value): ids[provider] = value
+    overrides = cfg.get('ARTWORK_ID_OVERRIDES', {})
+    ids.update({k: v for k, v in overrides.get(str(root.ratingKey), {}).items()
+                if k in ARTWORK_ID_FIELDS and valid_artwork_id(k, v)})
+    if item.type in ('season', 'episode'):
+        # Anime services use distinct entries per season; never inherit a whole-show anime ID.
+        for provider in ('anidb', 'anilist', 'mal'): ids.pop(provider, None)
+        ids.update({k: v for k, v in overrides.get(str(item.ratingKey), {}).items()
+                    if k in ARTWORK_ID_FIELDS and valid_artwork_id(k, v)})
+    return ArtworkContext(media_type=item.type, ids=ids,
+                          season_number=item.index if item.type == 'season' else getattr(item, 'parentIndex', None) if item.type == 'episode' else None,
+                          episode_number=item.index if item.type == 'episode' else None,
+                          is_anime=root.section().title in cfg.get('ANIME_LIBRARIES', []))
+
+def direct_artwork(item):
+    cfg = get_config()
+    context = artwork_context(item, cfg)
+    if not context.is_anime and not any(cfg.get(k) for k in ('TMDB_API_KEY', 'TVDB_API_KEY', 'FANART_API_KEY')):
+        return [], []
+    cache_fields = SECRET_CONFIG_KEYS + ('ANIDB_CLIENT', 'ANIDB_CLIENT_VERSION', 'ANIME_AUTO_MAPPING')
+    cache_data = (context.__dict__, {k: cfg.get(k) for k in cache_fields})
+    key = hashlib.sha256(json.dumps(cache_data, sort_keys=True).encode()).hexdigest()
+    with _artwork_cache_lock:
+        cached = _artwork_cache.get(key)
+        if cached and cached[0] > time.monotonic(): return cached[1], cached[2]
+    from artwork_providers import fetch_artwork as fetch_standard
+    from anime_providers import fetch_artwork as fetch_anime
+    standard, notices = fetch_standard(context, cfg)
+    anime, anime_notices = fetch_anime(context, cfg)
+    images = standard + anime
+    notices = notices + anime_notices
+    with _artwork_cache_lock:
+        if len(_artwork_cache) >= 128: _artwork_cache.pop(next(iter(_artwork_cache)))
+        _artwork_cache[key] = (time.monotonic() + (60 if notices else 300), images, notices)
+    return images, notices
+
+def artwork_choices(item):
+    choices = {'poster': [], 'background': [], 'clearlogo': []}
+    notices = []
+    methods = {'poster': 'posters'} if item.type == 'episode' else {'poster': 'posters', 'background': 'arts', 'clearlogo': 'logos'}
+    for kind, method in methods.items():
+        try: choices[kind] = list(getattr(item, method, lambda: [])())
+        except (PlexApiException, requests.RequestException):
+            notices.append(f'Unable to load Plex {kind} choices.')
+    images, direct_notices = direct_artwork(item)
+    for image in images:
+        if image.asset_type in methods: choices[image.asset_type].append(image)
+    if get_config().get('HIDE_UPLOADED_POSTERS', False):
+        choices['poster'] = [p for p in choices['poster'] if format_provider(getattr(p, 'provider', None)) != 'Upload']
+    return choices, notices + direct_notices
+
+def render_artwork_picker(item, lib):
+    choices, notices = artwork_choices(item)
+    cfg = get_config()
+    selected = {kind: get_history_url(item.ratingKey, kind) if check_file_exists(item, lib.title, kind) else None for kind in choices}
+    kinds = [('poster', 'Titlecards')] if item.type == 'episode' else [('poster', 'Posters'), ('background', 'Backgrounds'), ('clearlogo', 'Clearlogos')]
+    content = """
+    {% for notice in notices %}<div class="flash">{{ notice }}</div>{% endfor %}
+    <div class="path-info">Poster target: <strong>{{ target_path }}</strong></div>
+    {% if item.type != 'episode' %}
+    <details style="margin-bottom:20px;"><summary>Artwork IDs</summary>
+        <p>Detected IDs: {{ context.ids }}. TVDB/TMDB IDs refer to the movie or parent series. Anime IDs refer to this exact show/movie or season entry. Blank overrides restore automatic matching.</p>
+        <form method="post" action="{{ url_for('save_artwork_mapping', rating_key=item.ratingKey) }}">
+            {% for provider in id_fields %}<div class="form-group"><label>{{ provider }} ID</label><input name="{{ provider }}" value="{{ overrides.get(provider, '') }}" autocomplete="off"></div>{% endfor %}
+            <button type="submit" class="btn">Save Artwork IDs</button>
+        </form>
+    </details>
+    {% endif %}
+    <div class="tabs">
+        {% for kind, label in kinds %}<button class="tab-btn{% if loop.first %} active{% endif %}" onclick="switchTab('tab-{{ kind }}')">{{ label }}</button>{% endfor %}
+    </div>
+    {% for kind, label in kinds %}
+    <div id="tab-{{ kind }}" class="tab-content{% if loop.first %} active{% endif %}">
+        <div class="{% if kind == 'poster' and item.type != 'episode' %}poster-grid{% else %}background-grid{% endif %}">
+            {% for image in choices[kind] %}
+            {% set image_url = get_poster_url(image) %}
+            <form action="{{ url_for('download') }}" method="post" class="{% if kind == 'poster' and item.type != 'episode' %}poster-card{% else %}background-card{% endif %}{% if selected[kind] == image_url %} selected{% endif %}">
+                <div class="img-container">
+                    {% if selected[kind] == image_url %}<div class="selected-badge">CURRENT</div>{% endif %}
+                    <img src="{{ image_url }}" loading="lazy" alt="{{ label }} for {{ item.title }}"{% if kind == 'clearlogo' %} style="object-fit:contain; background:#333;"{% endif %}>
+                    <div class="provider-badge">{{ artwork_badge(image) }}</div>
+                </div>
+                <input type="hidden" name="poster_key" value="{{ image.key }}">
+                <input type="hidden" name="rating_key" value="{{ item.ratingKey }}">
+                <input type="hidden" name="img_type" value="{{ kind }}">
+                <button type="submit" class="btn">Download{% if item.type == 'episode' %} Titlecard{% endif %}</button>
+            </form>
+            {% else %}<p>No {{ label|lower }} available. Uploaded artwork may be hidden in Settings; configure provider credentials or Artwork IDs for additional choices.</p>{% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+    """
+    return render_template_string(content, item=item, choices=choices, kinds=kinds, notices=notices,
+                                  selected=selected, target_path=get_target_file_path(item, lib.title),
+                                  id_fields=ARTWORK_ID_FIELDS, context=artwork_context(item, cfg),
+                                  overrides=cfg.get('ARTWORK_ID_OVERRIDES', {}).get(str(item.ratingKey), {}),
+                                  get_poster_url=get_poster_url, artwork_badge=artwork_badge)  # nosemgrep: render-template-string
+
+def item_navigation(item, lib):
+    previous_item = next_item = None
+    navigation_error = False
+    endpoint = 'view_item'
+    order_label = 'Library title order'
+    try:
+        if item.type == 'season':
+            items = sorted(item.show().seasons(), key=lambda s: s.index)
+            endpoint, order_label = 'view_season', 'Season order'
+        elif item.type == 'episode':
+            items = sorted(item.season().episodes(), key=lambda e: e.index)
+            endpoint, order_label = 'view_episode', 'Episode order within season'
+        else:
+            items = lib.search(sort='titleSort', libtype=item.type)
+        for index, candidate in enumerate(items):
+            if str(candidate.ratingKey) == str(item.ratingKey):
+                if index > 0: previous_item = items[index - 1]
+                if index + 1 < len(items): next_item = items[index + 1]
+                break
+    except (requests.RequestException, NotFound, Unauthorized) as exc:
+        log_verbose(f"Unable to load item navigation: {exc}")
+        navigation_error = True
+    return render_template_string("""
+    <nav aria-label="Item navigation" style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-bottom:20px;">
+        {% if previous_item %}
+            <a class="page-btn" href="{{ url_for(endpoint, rating_key=previous_item.ratingKey) }}" rel="prev" title="{{ previous_item.title }}">&larr; Previous</a>
+        {% else %}
+            <span class="page-btn" style="opacity:0.5; cursor:not-allowed;" aria-disabled="true">&larr; Previous</span>
+        {% endif %}
+        <span style="color:var(--text-muted);">{% if navigation_error %}Unable to load item navigation{% else %}{{ order_label }}{% endif %}</span>
+        {% if next_item %}
+            <a class="page-btn" href="{{ url_for(endpoint, rating_key=next_item.ratingKey) }}" rel="next" title="{{ next_item.title }}">Next &rarr;</a>
+        {% else %}
+            <span class="page-btn" style="opacity:0.5; cursor:not-allowed;" aria-disabled="true">Next &rarr;</span>
+        {% endif %}
+    </nav>
+    """, previous_item=previous_item, next_item=next_item, navigation_error=navigation_error,
+        endpoint=endpoint, order_label=order_label)  # nosemgrep: render-template-string
+
 def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()
 
@@ -215,36 +397,20 @@ def get_target_file_path(item, lib_title=None, style=None, img_type='poster'):
         else: lib_title = "Unknown_Library"
              
     clean_lib = sanitize_filename(lib_title)
-    filename = "poster.jpg" if img_type == 'poster' else "background.jpg"
-    
-    if item.type == 'movie':
-        folder_name = get_physical_folder_name(item) 
+    if img_type not in ('poster', 'background', 'clearlogo'): return None
+    extension = '.png' if img_type == 'clearlogo' else '.jpg'
+    suffix = '' if img_type == 'poster' else f'_{img_type}'
+    if item.type in ('movie', 'show'):
+        folder = get_physical_folder_name(item)
         if current_style == 'NO_ASSET_FOLDERS':
-            suffix = "" if img_type == 'poster' else "_background"
-            return os.path.join(base_dir, clean_lib, f"{folder_name}{suffix}.jpg")
-        else:
-            return os.path.join(base_dir, clean_lib, folder_name, filename)
-
-    elif item.type == 'show':
-        folder_name = get_physical_folder_name(item)
-        if current_style == 'NO_ASSET_FOLDERS':
-            suffix = "" if img_type == 'poster' else "_background"
-            return os.path.join(base_dir, clean_lib, f"{folder_name}{suffix}.jpg")
-        else:
-            return os.path.join(base_dir, clean_lib, folder_name, filename)
-
-    elif item.type == 'season':
-        show = item.show()
-        show_folder = get_physical_folder_name(show)
-        season_idx = item.index
-        season_str = f"Season{season_idx:02d}"
-        if current_style == 'NO_ASSET_FOLDERS':
-            suffix = "" if img_type == 'poster' else "_background"
-            return os.path.join(base_dir, clean_lib, f"{show_folder}_{season_str}{suffix}.jpg")
-        else:
-            name = f"{season_str}.jpg" if img_type == 'poster' else f"{season_str}_background.jpg"
-            return os.path.join(base_dir, clean_lib, show_folder, name)
-    return None
+            return os.path.join(base_dir, clean_lib, f'{folder}{suffix}{extension}')
+        return os.path.join(base_dir, clean_lib, folder, f'{img_type}{extension}')
+    if item.type not in ('season', 'episode'): return None
+    folder = get_physical_folder_name(item.show())
+    name = f'Season{item.index:02d}' if item.type == 'season' else f'S{item.parentIndex:02d}E{item.index:02d}'
+    if current_style == 'NO_ASSET_FOLDERS':
+        return os.path.join(base_dir, clean_lib, f'{folder}_{name}{suffix}{extension}')
+    return os.path.join(base_dir, clean_lib, folder, f'{name}{suffix}{extension}')
 
 def check_file_exists(item, lib_title=None, img_type='poster'):
     target_path = get_target_file_path(item, lib_title, img_type=img_type)
@@ -273,6 +439,7 @@ _SAFE_REDIRECT_ROUTES = [
     (re.compile(r'^/library/(\d+)$'), 'view_library', 'lib_id'),
     (re.compile(r'^/item/(\d+)$'),    'view_item',    'rating_key'),
     (re.compile(r'^/season/(\d+)$'),  'view_season',  'rating_key'),
+    (re.compile(r'^/episode/(\d+)$'), 'view_episode', 'rating_key'),
     (re.compile(r'^/settings$'),      'settings',     None),
     (re.compile(r'^/$'),              'home',          None),
 ]
@@ -346,10 +513,47 @@ def validate_image_url(url):
         return False
 
 def get_poster_url(poster):
+    if isinstance(poster, Artwork): return poster.url
     key = getattr(poster, 'key', None)
     if not key: return ""
     if key.startswith('http') or key.startswith('https'): return key
     return plex.url(key)
+
+def save_image_response(response, path, img_type):
+    if response.status_code != 200: return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = None
+    descriptor = None
+    try:
+        try:
+            existing_mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            existing_mode = None
+        candidate = os.path.join(os.path.dirname(path), '.artwork-' + secrets.token_hex(16))
+        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        temporary = candidate
+        output = os.fdopen(descriptor, 'wb')
+        descriptor = None
+        with output:
+            size = 0
+            for chunk in response.iter_content(65536):
+                size += len(chunk)
+                if size > 30 * 1024 * 1024: raise ValueError('Image exceeds download size limit')
+                output.write(chunk)
+        if not size: raise ValueError('Empty image response')
+        if img_type == 'clearlogo':
+            with Image.open(temporary) as image:
+                if image.width * image.height > 25000000: raise ValueError('Clearlogo dimensions are too large')
+                normalized = image.convert('RGBA')
+            normalized.save(temporary, format='PNG')
+        if existing_mode is not None:
+            os.chmod(temporary, existing_mode)
+        os.replace(temporary, path)
+        temporary = None
+        return True
+    finally:
+        if descriptor is not None: os.close(descriptor)
+        if temporary and os.path.exists(temporary): os.unlink(temporary)
 
 # ==========================================
 # 4. HISTORY MANAGEMENT
@@ -377,13 +581,15 @@ def save_history_data(data):
 
 def save_download_history(rating_key, img_url, img_type='poster'):
     data = load_history_data()
-    key = str(rating_key) if img_type == 'poster' else f"{rating_key}_bg"
+    suffix = {'poster': '', 'background': '_bg', 'clearlogo': '_logo'}[img_type]
+    key = f'{rating_key}{suffix}'
     data["downloads"][key] = img_url
     save_history_data(data)
 
 def get_history_url(rating_key, img_type='poster'):
     data = load_history_data()
-    key = str(rating_key) if img_type == 'poster' else f"{rating_key}_bg"
+    suffix = {'poster': '', 'background': '_bg', 'clearlogo': '_logo'}[img_type]
+    key = f'{rating_key}{suffix}'
     return data["downloads"].get(key)
 
 def toggle_override_status(rating_key):
@@ -435,6 +641,7 @@ def get_library_stats(lib):
         'content_str': "0 Items",
         'downloaded_count': 0,
         'bg_downloaded_count': 0,
+        'clearlogo_count': 0,
         'disk_size': 0,
         'size_str': "0 B"
     }
@@ -463,6 +670,7 @@ def get_library_stats(lib):
     
     file_count = 0
     bg_count = 0
+    logo_count = 0
     total_size = 0
     
     if os.path.exists(lib_dir):
@@ -473,13 +681,16 @@ def get_library_stats(lib):
                     total_size += os.path.getsize(fp)
                     
                     # Detect backgrounds
-                    if 'background' in f.lower():
+                    if 'clearlogo' in f.lower():
+                        logo_count += 1
+                    elif 'background' in f.lower():
                         bg_count += 1
                     else:
                         file_count += 1
     
     stats['downloaded_count'] = file_count
     stats['bg_downloaded_count'] = bg_count
+    stats['clearlogo_count'] = logo_count
     stats['disk_size'] = total_size
     stats['size_str'] = format_size(total_size)
     return stats
@@ -487,6 +698,25 @@ def get_library_stats(lib):
 # ==========================================
 # 6. CRON SCHEDULER (Threaded)
 # ==========================================
+def scheduled_items(items, cfg):
+    for item in items:
+        yield item
+        if item.type != 'show': continue
+        if not (cfg.get('CRON_DOWNLOAD_SEASONS', False) or cfg.get('CRON_DOWNLOAD_TITLECARDS', False)):
+            continue
+        try: seasons = item.seasons()
+        except Exception as exc:
+            log_verbose(f"Cron: Unable to load seasons for {item.title}: {exc}")
+            continue
+        for season in seasons:
+            if cfg.get('CRON_DOWNLOAD_SEASONS', False): yield season
+            if cfg.get('CRON_DOWNLOAD_TITLECARDS', False):
+                try: episodes = season.episodes()
+                except Exception as exc:
+                    log_verbose(f"Cron: Unable to load episodes for {season.title}: {exc}")
+                    continue
+                yield from episodes
+
 def run_cron_job():
     if not plex: return
     cfg = get_config()
@@ -511,27 +741,36 @@ def run_cron_job():
             log_verbose(f"Cron: Processing Library '{lib.title}'...")
             items = lib.all()
             
-            for item in items:
+            for item in scheduled_items(items, cfg):
                 tasks = [('poster', 'posters')]
-                if dl_bgs: tasks.append(('background', 'arts'))
+                if dl_bgs and item.type != 'episode': tasks.append(('background', 'arts'))
+                if cfg.get('CRON_DOWNLOAD_CLEARLOGOS', False) and item.type != 'episode': tasks.append(('clearlogo', 'logos'))
+                all_choices = None
                 
                 for img_type, method in tasks:
                     if check_file_exists(item, lib.title, img_type):
                         skipped += 1
                         continue
                     
-                    try: candidates = getattr(item, method)()
-                    except: continue
+                    if all_choices is None:
+                        try: all_choices, notices = artwork_choices(item)
+                        except Exception:
+                            log_verbose(f'Cron: Unable to load artwork for {item.title}')
+                            break
+                        for notice in notices: log_verbose(notice)
+                    candidates = all_choices[img_type]
                     if not candidates: continue
                     
                     selected_img = None
-                    valid = [p for p in candidates if p.provider]
+                    valid = [p for p in candidates if format_provider(getattr(p, 'provider', None)) != 'Upload']
                     if not valid: continue
 
                     if mode == 'RANDOM':
                         selected_img = random.choice(valid)
                     elif mode in ['SPECIFIC_PROVIDER', 'RANDOM_PROVIDER']:
-                        matching = [p for p in valid if target_provider in str(p.provider).lower()]
+                        matching = [p for p in valid if target_provider in str(p.provider).lower()
+                                    or target_provider == format_provider(p.provider).lower()
+                                    or target_provider == artwork_badge(p)]
                         if matching:
                             if mode == 'SPECIFIC_PROVIDER': selected_img = matching[0]
                             else: selected_img = random.choice(matching)
@@ -541,22 +780,22 @@ def run_cron_job():
                             lib_title = item.section().title
                             save_path = get_target_file_path(item, lib_title, img_type=img_type)
                             if save_path:
-                                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                                key = selected_img.key
-                                url = key if key.startswith('http') else plex.url(key)
+                                url = get_poster_url(selected_img)
 
                                 if not validate_image_url(url):
-                                    log_verbose(f"Cron: Skipping {item.title} — URL failed SSRF validation: {url}")
+                                    log_verbose(f"Cron: Skipping {item.title} — URL failed SSRF validation")
                                     continue
-                                log_verbose(f"Cron: Downloading {img_type} for {item.title} (Provider: {selected_img.provider})")
-                                r = requests.get(url, stream=True)
-                                if r.status_code == 200:
-                                    with open(save_path, 'wb') as f:
-                                        for chunk in r.iter_content(1024): f.write(chunk)
-                                    save_download_history(item.ratingKey, url, img_type)
-                                    processed += 1
-                        except Exception as e:
-                            log_verbose(f"Cron Error saving {item.title}: {e}")
+                                log_verbose(f"Cron: Downloading {img_type} for {item.title} (Provider: {artwork_badge(selected_img)})")
+                                r = requests.get(url, stream=True, timeout=(5, 30), allow_redirects=False)
+                                try:
+                                    if save_image_response(r, save_path, img_type):
+                                        save_download_history(item.ratingKey, url, img_type)
+                                        processed += 1
+                                finally:
+                                    close = getattr(r, 'close', None)
+                                    if callable(close): close()
+                        except Exception:
+                            log_verbose(f"Cron Error saving {item.title}")
         log_verbose(f"Cron Finished. Downloaded: {processed}, Skipped: {skipped}")
     except Exception as e:
         log_verbose(f"Cron Job Failed: {e}")
@@ -697,7 +936,7 @@ CSS_COMMON = """
     .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--primary); }
     .form-group input:disabled { background: #0a0a0a; color: #555; border-color: #222; cursor: not-allowed; }
     .flash { background: rgba(229, 160, 13, 0.2); color: var(--accent); padding: 15px; margin-bottom: 25px; border-radius: 8px; border: 1px solid var(--accent); }
-    .path-info { font-size: 0.85em; color: var(--text-muted); margin-bottom: 15px; font-family: monospace; background: rgba(0,0,0,0.3); padding: 5px 10px; border-radius: 4px; display: inline-block; }
+    .path-info { font-size: 0.85em; color: var(--text-muted); margin-bottom: 15px; font-family: monospace; background: rgba(0,0,0,0.3); padding: 5px 10px; border-radius: 4px; display: inline-block; max-width:100%; box-sizing:border-box; overflow-wrap:anywhere; }
     .section-header { margin-top: 50px; border-bottom: 2px solid var(--nav); padding-bottom: 10px; margin-bottom: 25px; display: flex; align-items: center; justify-content: space-between; }
     .section-header h2 { margin: 0; font-size: 1.4em; }
     .section-header span { font-size: 0.9em; color: var(--text-muted); background: var(--nav); padding: 4px 10px; border-radius: 20px; }
@@ -708,7 +947,7 @@ CSS_COMMON = """
     .stats-table tr:last-child td { border-bottom: none; }
     .stats-table tr:hover { background: rgba(255,255,255,0.02); }
     .stat-number { font-family: monospace; color: var(--accent); font-weight: bold; }
-    .tabs { display: flex; border-bottom: 1px solid var(--border-color); margin-bottom: 20px; }
+    .tabs { display: flex; flex-wrap:wrap; border-bottom: 1px solid var(--border-color); margin-bottom: 20px; }
     .tab-btn { background: transparent; border: none; padding: 15px 25px; font-size: 1.1em; font-weight: 600; color: var(--text-muted); cursor: pointer; border-bottom: 3px solid transparent; }
     .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
     .tab-btn:hover { color: var(--text); }
@@ -984,10 +1223,26 @@ def settings():
             token_input = request.form.get('plex_token', '').strip()
             if token_input and token_input != '(Encrypted)':
                 cfg['PLEX_TOKEN'] = token_input
+            for key in SECRET_CONFIG_KEYS:
+                if key == 'PLEX_TOKEN': continue
+                field = key.lower()
+                if request.form.get(f'clear_{field}') == 'on':
+                    cfg[key] = ''
+                elif request.form.get(field, '').strip():
+                    cfg[key] = request.form[field].strip()
+            cfg['ANIDB_CLIENT'] = request.form.get('anidb_client', cfg.get('ANIDB_CLIENT', '')).strip()
+            version = request.form.get('anidb_client_version', cfg.get('ANIDB_CLIENT_VERSION', '1')).strip()
+            if not re.fullmatch(r'[1-9]\d{0,3}', version):
+                flash('AniDB client version must be a positive integer.')
+                return redirect(url_for('settings'))
+            cfg['ANIDB_CLIENT_VERSION'] = version
+            cfg['ANIME_LIBRARIES'] = request.form.getlist('anime_libs')
+            cfg['ANIME_AUTO_MAPPING'] = request.form.get('anime_auto_mapping') == 'on'
             
             cfg['DOWNLOAD_BASE_DIR'] = request.form.get('download_dir', 'downloaded_posters').strip()
             cfg['HISTORY_FILE'] = request.form.get('history_file', 'download_history.json').strip()
             cfg['ASSET_STYLE'] = request.form.get('asset_style', 'ASSET_FOLDERS')
+            cfg['HIDE_UPLOADED_POSTERS'] = (request.form.get('hide_uploaded_posters') == 'on')
             cfg['CRON_ENABLED'] = (request.form.get('cron_enabled') == 'on')
             
             # Time Handling
@@ -1011,6 +1266,9 @@ def settings():
             cfg['CRON_MODE'] = request.form.get('cron_mode', 'RANDOM')
             cfg['CRON_PROVIDER'] = request.form.get('cron_provider', '').strip()
             cfg['CRON_DOWNLOAD_BACKGROUNDS'] = (request.form.get('cron_download_backgrounds') == 'on')
+            cfg['CRON_DOWNLOAD_SEASONS'] = (request.form.get('cron_download_seasons') == 'on')
+            cfg['CRON_DOWNLOAD_TITLECARDS'] = (request.form.get('cron_download_titlecards') == 'on')
+            cfg['CRON_DOWNLOAD_CLEARLOGOS'] = (request.form.get('cron_download_clearlogos') == 'on')
             cfg['VERBOSE_LOGGING'] = (request.form.get('cron_logging') == 'on')
             cfg['IGNORED_LIBRARIES'] = request.form.getlist('ignored_libs')
             cfg['CRON_LIBRARIES'] = request.form.getlist('cron_libs')
@@ -1086,8 +1344,8 @@ def settings():
 
     # Prepare config for display (mask token)
     display_cfg = cfg.copy()
-    if display_cfg['PLEX_TOKEN']:
-        display_cfg['PLEX_TOKEN'] = '(Encrypted)'
+    for key in SECRET_CONFIG_KEYS:
+        if display_cfg.get(key): display_cfg[key] = '(Encrypted)'
 
     content = """
     <div style="max-width: 800px; margin: 0 auto;">
@@ -1113,6 +1371,36 @@ def settings():
                 </div>
 
                 <div class="form-group"><label>Download Directory</label><input type="text" name="download_dir" value="{{ cfg.DOWNLOAD_BASE_DIR }}"></div>
+                <h3>Direct Artwork Providers</h3>
+                <p style="color:var(--text-muted);">Optional credentials are encrypted on disk. Blank fields keep existing values. Plex sources remain available without these keys.</p>
+                {% for key, label in [('TMDB_API_KEY', 'TMDB API key or read access token'), ('TVDB_API_KEY', 'TVDB v4 API key'), ('TVDB_PIN', 'TVDB subscriber PIN (if required)'), ('FANART_API_KEY', 'fanart.tv API key'), ('MAL_CLIENT_ID', 'MyAnimeList Client ID')] %}
+                <div class="form-group">
+                    <label for="{{ key|lower }}">{{ label }}</label>
+                    <input type="password" name="{{ key|lower }}" id="{{ key|lower }}" autocomplete="new-password" placeholder="{% if cfg[key] %}Configured — leave blank to keep{% else %}Not configured{% endif %}">
+                    <div style="display:flex; gap:8px; align-items:center; margin-top:5px;">
+                        <input type="checkbox" name="clear_{{ key|lower }}" id="clear_{{ key|lower }}" style="width:auto;">
+                        <label for="clear_{{ key|lower }}" style="margin:0; font-weight:400;">Remove saved credential</label>
+                    </div>
+                </div>
+                {% endfor %}
+                <h3>Anime Artwork</h3>
+                <p style="color:var(--text-muted);">AniList needs no key. MyAnimeList uses the Client ID above. AniDB requires your registered/approved HTTP API client; it is not an API key.</p>
+                <div class="form-group"><label>AniDB client name</label><input name="anidb_client" value="{{ cfg.ANIDB_CLIENT }}"></div>
+                <div class="form-group"><label>AniDB client version</label><input name="anidb_client_version" value="{{ cfg.ANIDB_CLIENT_VERSION }}" type="number" min="1" max="9999"></div>
+                <div class="form-group">
+                    <label>Anime Libraries</label>
+                    {% for lib in all_libs %}
+                    <div style="display:flex; gap:8px; align-items:center;">
+                        <input type="checkbox" name="anime_libs" value="{{ lib.title }}" id="anime_lib_{{ loop.index }}" style="width:auto;" {% if lib.title in cfg.ANIME_LIBRARIES %}checked{% endif %}>
+                        <label for="anime_lib_{{ loop.index }}" style="margin:0; font-weight:400;">{{ lib.title }}</label>
+                    </div>
+                    {% else %}<p>Connect Plex to select anime libraries.</p>{% endfor %}
+                </div>
+                <div class="form-group" style="display:flex; gap:8px; align-items:center;">
+                    <input type="checkbox" name="anime_auto_mapping" id="anime_auto_mapping" style="width:auto;" {% if cfg.ANIME_AUTO_MAPPING %}checked{% endif %}>
+                    <label for="anime_auto_mapping" style="margin:0; font-weight:400;">Use automatic anime ID mappings when unambiguous</label>
+                </div>
+                <p style="color:var(--text-muted);">Use Artwork IDs on a show or season to correct matches. Anime season IDs are separate from the TVDB/TMDB series ID; ambiguous matches are not guessed.</p>
                 <div class="form-group"><label>Asset Folder Style</label>
                     <select name="asset_style">
                         <option value="ASSET_FOLDERS" {% if cfg.ASSET_STYLE == 'ASSET_FOLDERS' %}selected{% endif %}>Asset Folders (Kometa Default)</option>
@@ -1124,6 +1412,13 @@ def settings():
                     </small>
                 </div>
                 <div class="form-group"><label>History File Name</label><input type="text" name="history_file" value="{{ cfg.HISTORY_FILE }}"></div>
+                <div class="form-group">
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <input type="checkbox" name="hide_uploaded_posters" id="hide_uploaded_posters" style="width:auto;" {% if cfg.HIDE_UPLOADED_POSTERS %}checked{% endif %}>
+                        <label for="hide_uploaded_posters" style="margin:0; font-weight:400;">Hide uploaded posters</label>
+                    </div>
+                    <small style="color:var(--text-muted);">Hide choices labeled Upload for movies, shows, seasons, and episode titlecards. Backgrounds and existing files are unchanged.</small>
+                </div>
                 
                 <div class="form-group" style="display:flex; align-items:center; gap:10px; margin-top: 15px;">
                     <input type="checkbox" name="cron_logging" id="cron_logging" style="width:auto;" {% if cfg.VERBOSE_LOGGING %}checked{% endif %}>
@@ -1152,6 +1447,19 @@ def settings():
                         <input type="checkbox" name="cron_download_backgrounds" id="cron_download_backgrounds" style="width:auto;" {% if cfg.CRON_DOWNLOAD_BACKGROUNDS %}checked{% endif %}>
                         <label for="cron_download_backgrounds" style="margin:0;">Download Backgrounds</label>
                     </div>
+                    <div class="form-group" style="display:flex; align-items:center; gap:10px;">
+                        <input type="checkbox" name="cron_download_seasons" id="cron_download_seasons" style="width:auto;" {% if cfg.CRON_DOWNLOAD_SEASONS %}checked{% endif %}>
+                        <label for="cron_download_seasons" style="margin:0;">Download Season Posters</label>
+                    </div>
+                    <div class="form-group" style="display:flex; align-items:center; gap:10px;">
+                        <input type="checkbox" name="cron_download_titlecards" id="cron_download_titlecards" style="width:auto;" {% if cfg.CRON_DOWNLOAD_TITLECARDS %}checked{% endif %}>
+                        <label for="cron_download_titlecards" style="margin:0;">Download Episode Titlecards</label>
+                    </div>
+                    <div class="form-group" style="display:flex; align-items:center; gap:10px;">
+                        <input type="checkbox" name="cron_download_clearlogos" id="cron_download_clearlogos" style="width:auto;" {% if cfg.CRON_DOWNLOAD_CLEARLOGOS %}checked{% endif %}>
+                        <label for="cron_download_clearlogos" style="margin:0;">Download Clearlogos</label>
+                    </div>
+                    <small style="color:var(--text-muted);">Child artwork is opt-in and uses the same provider selection. Existing files are skipped. Backgrounds also apply to enabled seasons, not episodes.</small>
 
                     <div class="form-group" style="display: flex; gap: 20px; flex-wrap: wrap;">
                         <div style="flex: 1; min-width: 150px;">
@@ -1219,6 +1527,9 @@ def settings():
                             <option value="gracenote" {% if cfg.CRON_PROVIDER == 'gracenote' %}selected{% endif %}>Gracenote</option>
                             <option value="movieposterdb" {% if cfg.CRON_PROVIDER == 'movieposterdb' %}selected{% endif %}>MoviePosterDB</option>
                             <option value="local" {% if cfg.CRON_PROVIDER == 'local' %}selected{% endif %}>Local</option>
+                            {% for provider in ['anidb', 'anilist', 'mal', 'tmdb_plex', 'tvdb_plex', 'fanart.tv_plex'] %}
+                            <option value="{{ provider }}" {% if cfg.CRON_PROVIDER == provider %}selected{% endif %}>{{ provider }}</option>
+                            {% endfor %}
                         </select>
                     </div>
                 </div>
@@ -1399,69 +1710,9 @@ def view_item(rating_key):
     except: return "Not Found", 404
     
     is_show = item.type == 'show'
-    posters = item.posters()
-    backgrounds = item.arts()
-    folder_name = get_physical_folder_name(item)
     lib = item.section()
-    
-    sel_poster = get_history_url(rating_key, 'poster')
-    sel_bg = get_history_url(rating_key, 'background')
-    
-    if sel_poster and not check_file_exists(item, lib.title, 'poster'): sel_poster = None
-    if sel_bg and not check_file_exists(item, lib.title, 'background'): sel_bg = None
-    
     seasons = item.seasons() if is_show else []
-    target_path = get_target_file_path(item, lib.title)
-    
-    cfg = get_config()
-    base_dir = cfg.get('DOWNLOAD_BASE_DIR', '')
-    if not os.path.isabs(base_dir) and DATA_DIR != '.': base_dir = os.path.join(DATA_DIR, base_dir)
-    rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
-
-    content = f"""
-    <div class="path-info">Target Folder: <strong>.../{safe_html(rel_path)}/</strong></div>
-    <div class="tabs">
-        <button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button>
-        <button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button>
-    </div>
-
-    <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
-    for p in posters:
-        p_url = get_poster_url(p)
-        sel_class = 'selected' if p_url == sel_poster else ''
-        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        content += f"""
-        <form action="/download" method="post" class="poster-card {sel_class}">
-            <div class="img-container">
-                {badge}
-                <img src="{safe_html(p_url)}" loading="lazy">
-                <div class="provider-badge">{safe_html(format_provider(p.provider))}</div>
-            </div>
-            <input type="hidden" name="poster_key" value="{safe_html(getattr(p, 'key', ''))}">
-            <input type="hidden" name="rating_key" value="{item.ratingKey}">
-            <input type="hidden" name="img_type" value="poster">
-            <button type="submit" class="btn">Download</button>
-        </form>"""
-    content += "</div></div>"
-
-    content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
-    for bg in backgrounds:
-        b_url = get_poster_url(bg)
-        sel_class = 'selected' if b_url == sel_bg else ''
-        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        content += f"""
-        <form action="/download" method="post" class="background-card {sel_class}">
-            <div class="img-container">
-                {badge}
-                <img src="{safe_html(b_url)}" loading="lazy">
-                <div class="provider-badge">{safe_html(format_provider(bg.provider))}</div>
-            </div>
-            <input type="hidden" name="poster_key" value="{safe_html(getattr(bg, 'key', ''))}">
-            <input type="hidden" name="rating_key" value="{item.ratingKey}">
-            <input type="hidden" name="img_type" value="background">
-            <button type="submit" class="btn">Download</button>
-        </form>"""
-    content += "</div></div>"
+    content = item_navigation(item, lib) + render_artwork_picker(item, lib)
 
     if is_show:
         content += f"""<div class="section-header"><h2>Seasons</h2></div><div class="grid">"""
@@ -1476,65 +1727,69 @@ def view_item(rating_key):
 @app.route('/season/<rating_key>')
 def view_season(rating_key):
     if not plex: return redirect(url_for('settings'))
-    season = plex.fetchItem(int(rating_key))
+    try: season = plex.fetchItem(int(rating_key))
+    except (ValueError, NotFound): return "Not Found", 404
+    if season.type != 'season': return "Not Found", 404
     show = season.show()
-    posters = season.posters()
-    backgrounds = season.arts()
     lib = show.section()
+    content = item_navigation(season, lib) + render_artwork_picker(season, lib)
     
-    sel_poster = get_history_url(rating_key, 'poster')
-    sel_bg = get_history_url(rating_key, 'background')
-    
-    if sel_poster and not check_file_exists(season, lib.title, 'poster'): sel_poster = None
-    if sel_bg and not check_file_exists(season, lib.title, 'background'): sel_bg = None
-    
-    target_path = get_target_file_path(season, lib.title)
-    cfg = get_config()
-    base_dir = cfg.get('DOWNLOAD_BASE_DIR', '')
-    if not os.path.isabs(base_dir) and DATA_DIR != '.': base_dir = os.path.join(DATA_DIR, base_dir)
-    rel_path = os.path.relpath(os.path.dirname(target_path), base_dir) if target_path else "Unknown"
-    
-    content = f"""
-    <div class="path-info">Target: <strong>.../{safe_html(rel_path)}/</strong></div>
-    <div class="tabs"><button class="tab-btn active" onclick="switchTab('tab-posters')">Posters</button><button class="tab-btn" onclick="switchTab('tab-backgrounds')">Backgrounds</button></div>
-
-    <div id="tab-posters" class="tab-content active"><div class="poster-grid">"""
-    for p in posters:
-        p_url = get_poster_url(p)
-        sel_class = 'selected' if p_url == sel_poster else ''
-        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        content += f"""
-        <form action="/download" method="post" class="poster-card {sel_class}">
-            <div class="img-container">{badge}<img src="{safe_html(p_url)}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(p.provider))}</div></div>
-            <input type="hidden" name="poster_key" value="{safe_html(getattr(p, 'key', ''))}">
-            <input type="hidden" name="rating_key" value="{season.ratingKey}">
-            <input type="hidden" name="img_type" value="poster">
-            <button type="submit" class="btn">Download</button>
-        </form>"""
-    content += "</div></div>"
-
-    content += """<div id="tab-backgrounds" class="tab-content"><div class="background-grid">"""
-    for bg in backgrounds:
-        b_url = get_poster_url(bg)
-        sel_class = 'selected' if b_url == sel_bg else ''
-        badge = f'<div class="selected-badge">CURRENT</div>' if sel_class else ''
-        content += f"""
-        <form action="/download" method="post" class="background-card {sel_class}">
-            <div class="img-container">{badge}<img src="{safe_html(b_url)}" loading="lazy"><div class="provider-badge">{safe_html(format_provider(bg.provider))}</div></div>
-            <input type="hidden" name="poster_key" value="{safe_html(getattr(bg, 'key', ''))}">
-            <input type="hidden" name="rating_key" value="{season.ratingKey}">
-            <input type="hidden" name="img_type" value="background">
-            <button type="submit" class="btn">Download</button>
-        </form>"""
-    content += "</div></div>"
-    
+    content += render_template_string("""
+    <div class="section-header"><h2>Episode Titlecards</h2></div>
+    <div class="background-grid">
+        {% for episode in episodes %}
+        <a href="{{ url_for('view_episode', rating_key=episode.ratingKey) }}" class="background-card">
+            {% if episode.thumb %}<img src="{{ episode.thumbUrl }}" loading="lazy" alt="{{ episode.title }}">{% endif %}
+            <div class="title">E{{ '%02d' % episode.index }} &mdash; {{ episode.title }}</div>
+        </a>
+        {% else %}<p>No episodes found.</p>{% endfor %}
+    </div>
+    """, episodes=sorted(season.episodes(), key=lambda e: e.index))  # nosemgrep: render-template-string
     return render_template_string(HTML_TOP + "{{ page_content }}" + HTML_BOTTOM, page_content=Markup(content), title=f"{show.title} - {season.title}", breadcrumbs=[(lib.title, f'/library/{lib.key}'), (show.title, f'/item/{show.ratingKey}'), (season.title, '#')], toggle_override=False)  # nosemgrep: render-template-string,explicit-unescape-with-markup
+
+@app.route('/episode/<rating_key>')
+def view_episode(rating_key):
+    if not plex: return redirect(url_for('settings'))
+    try: episode = plex.fetchItem(int(rating_key))
+    except (ValueError, NotFound): return "Not Found", 404
+    if episode.type != 'episode': return "Not Found", 404
+    show = episode.show()
+    season = episode.season()
+    lib = show.section()
+    content = item_navigation(episode, lib) + render_artwork_picker(episode, lib)
+    return render_template_string(HTML_TOP + '{{ page_content }}' + HTML_BOTTOM,
+                                  title=f'{show.title} - S{episode.parentIndex:02d}E{episode.index:02d} - {episode.title}',
+                                  breadcrumbs=[(lib.title, f'/library/{lib.key}'), (show.title, f'/item/{show.ratingKey}'),
+                                               (season.title, f'/season/{season.ratingKey}'), (episode.title, '#')],
+                                  toggle_override=False, page_content=Markup(content))  # nosemgrep: render-template-string,explicit-unescape-with-markup
+
+@app.route('/artwork-mapping/<rating_key>', methods=['POST'])
+def save_artwork_mapping(rating_key):
+    if not plex: return redirect(url_for('settings'))
+    try: item = plex.fetchItem(int(rating_key))
+    except (ValueError, NotFound): return 'Not Found', 404
+    if item.type not in ('movie', 'show', 'season'): return 'Invalid mapping target', 400
+    mapping = {}
+    for provider in ARTWORK_ID_FIELDS:
+        value = request.form.get(provider, '')
+        if not value: continue
+        if not valid_artwork_id(provider, value): return f'Invalid {provider} ID', 400
+        mapping[provider] = value
+    cfg = get_config()
+    overrides = dict(cfg.get('ARTWORK_ID_OVERRIDES', {}))
+    if mapping: overrides[str(item.ratingKey)] = mapping
+    else: overrides.pop(str(item.ratingKey), None)
+    cfg['ARTWORK_ID_OVERRIDES'] = overrides
+    save_config(cfg)
+    flash('Artwork ID overrides saved.')
+    return redirect(url_for('view_season' if item.type == 'season' else 'view_item', rating_key=item.ratingKey))
 
 @app.route('/download', methods=['POST'])
 def download():
     if not plex: return redirect(url_for('settings'))
     rating_key   = request.form.get('rating_key')
     img_type     = request.form.get('img_type', 'poster')
+    if img_type not in ('poster', 'background', 'clearlogo'): return 'Invalid image type', 400
     poster_key   = request.form.get('poster_key', '')
     if not poster_key:
         flash("Missing poster key.")
@@ -1545,7 +1800,8 @@ def download():
         # whose key matches the submitted value.  img_url is derived from the
         # matched Plex API object (not from user input), breaking the SSRF
         # taint chain that CodeQL would otherwise flag.
-        sources = item.posters() if img_type == 'poster' else item.arts()
+        choices, _ = artwork_choices(item)
+        sources = choices[img_type]
         matched = next((s for s in sources if getattr(s, 'key', None) == poster_key), None)
         if matched is None:
             flash("Poster not found.")
@@ -1557,15 +1813,17 @@ def download():
         lib_title = item.section().title
         save_path = get_target_file_path(item, lib_title, img_type=img_type)
         if save_path:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            r = requests.get(img_url, stream=True)
-            if r.status_code == 200:
-                with open(save_path, 'wb') as f:
-                    for chunk in r.iter_content(1024): f.write(chunk)
-                save_download_history(rating_key, img_url, img_type)
-                flash(f"Saved {img_type}!")
-            else: flash("Download failed.")
-    except Exception as e: flash(f"Error: {e}")
+            r = requests.get(img_url, stream=True, timeout=(5, 30), allow_redirects=False)
+            try:
+                if save_image_response(r, save_path, img_type):
+                    save_download_history(rating_key, img_url, img_type)
+                    flash(f"Saved {img_type}!")
+                else: flash("Download failed.")
+            finally:
+                close = getattr(r, 'close', None)
+                if callable(close): close()
+    except Exception:
+        flash('Unable to download artwork. Check the source and provider settings.')
     return safe_referrer_redirect()
 
 @app.route('/toggle_complete', methods=['POST'])

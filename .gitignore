@@ -1,6 +1,8 @@
 config/
 config.json
 download_history.json
+.secret.key
+.anime-provider-cache/
 downloaded_posters/
 
 pycache/

@@ -6,6 +6,8 @@ on:
     paths:
       - '.github/**'
       - 'plex_poster_downloader.py'
+      - 'artwork_*.py'
+      - 'anime_providers.py'
       - 'Dockerfile'
       - 'requirements.txt'
       - 'tests/**'
@@ -14,6 +16,8 @@ on:
     paths:
       - '.github/**'
       - 'plex_poster_downloader.py'
+      - 'artwork_*.py'
+      - 'anime_providers.py'
       - 'Dockerfile'
       - 'requirements.txt'
       - 'tests/**'
@@ -95,7 +99,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
 
-      - name: Check runtime image dependencies
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run unit and runtime image tests
         env:
           TEST_IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
         run: python -m unittest discover -s tests -v
