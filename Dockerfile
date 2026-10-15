@@ -4,6 +4,8 @@ FROM python:3.15-slim
 # Set the working directory
 WORKDIR /app
 
+COPY requirements.txt .
+
 # Upgrade pip first
 RUN pip install --upgrade pip
 
@@ -14,10 +16,13 @@ RUN pip install --upgrade pip
 # dependency slots to the newer, patched versions.
 # gosu is used by the entrypoint to drop from root to appuser after fixing
 # bind-mount permissions on /app/config.
+# Remove build-only pip and its vendored libraries from the runtime image.
 RUN apt-get update && apt-get install -y --no-install-recommends gosu \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir "wheel>=0.46.2" "jaraco.context>=6.1.0" \
-    && pip install --no-cache-dir Flask PlexAPI requests cryptography
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip check \
+    && pip uninstall --yes pip
 
 # Copy the application and entrypoint
 COPY plex_poster_downloader.py .

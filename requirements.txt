@@ -1,3 +1,5 @@
 Flask
 PlexAPI
 requests
+cryptography
+urllib3>=2.8.0

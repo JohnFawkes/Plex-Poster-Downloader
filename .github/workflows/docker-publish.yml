@@ -8,6 +8,7 @@ on:
       - 'plex_poster_downloader.py'
       - 'Dockerfile'
       - 'requirements.txt'
+      - 'tests/**'
   pull_request:
     branches: [ "main" ]
     paths:
@@ -15,6 +16,7 @@ on:
       - 'plex_poster_downloader.py'
       - 'Dockerfile'
       - 'requirements.txt'
+      - 'tests/**'
   workflow_dispatch:
 env:
   REGISTRY: ghcr.io
@@ -92,6 +94,11 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
+
+      - name: Check runtime image dependencies
+        env:
+          TEST_IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: python -m unittest discover -s tests -v
 
       - name: Run Container for Testing
         run: |
